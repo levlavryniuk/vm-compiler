@@ -1,4 +1,7 @@
-use crate::ir::{Instruction, IrProgram, OpCode, Operand};
+use crate::{
+    ast_node::LiteralValue,
+    ir::{Instruction, IrProgram, OpCode, Operand},
+};
 
 #[derive(Debug, Clone, Copy)]
 pub enum BytecodeOp {
@@ -10,18 +13,30 @@ pub enum BytecodeOp {
     Multiply,
     Divide,
     Negate,
+    Echo,
+    Equals,
+    NotEquals,
     Return,
+    EnterFrame,
+    ExitFrame,
+
+    Greater,
+    Less,
+    GreaterOrEq,
+    LessOrEq,
+    JumpIfFalse,
+    Jump,
 }
 
 #[derive(Debug)]
 pub struct Bytecode {
-    pub constants: Vec<f64>,
+    pub constants: Vec<LiteralValue>,
     pub variables: Vec<String>,
     pub instructions: Vec<(BytecodeOp, Option<usize>)>,
 }
 
 pub struct BytecodeGenerator {
-    constants: Vec<f64>,
+    constants: Vec<LiteralValue>,
     variables: Vec<String>,
     instructions: Vec<(BytecodeOp, Option<usize>)>,
 }
@@ -53,11 +68,36 @@ impl BytecodeGenerator {
     fn generate_instruction(&mut self, instruction: &Instruction) {
         match instruction.op {
             OpCode::LoadConst => {
-                if let Operand::Immediate(value) = instruction.operands[1] {
-                    let const_idx = self.add_constant(value);
+                if let Operand::Immediate(value) = &instruction.operands[1] {
+                    let const_idx = self.add_constant(value.clone());
                     self.emit(BytecodeOp::LoadConst, Some(const_idx));
                 }
             }
+
+            OpCode::Equals => {
+                self.emit(BytecodeOp::Equals, None);
+            }
+
+            OpCode::LessOrEq => {
+                self.emit(BytecodeOp::LessOrEq, None);
+            }
+
+            OpCode::Less => {
+                self.emit(BytecodeOp::Less, None);
+            }
+
+            OpCode::GreaterOrEq => {
+                self.emit(BytecodeOp::GreaterOrEq, None);
+            }
+
+            OpCode::Greater => {
+                self.emit(BytecodeOp::Greater, None);
+            }
+            OpCode::NotEquals => {
+                self.emit(BytecodeOp::NotEquals, None);
+            }
+            OpCode::Echo => self.emit(BytecodeOp::Echo, None),
+
             OpCode::LoadVar => {
                 if let Operand::Variable(ref name) = instruction.operands[1] {
                     let var_idx = self.add_variable(name);
@@ -70,6 +110,20 @@ impl BytecodeGenerator {
                     self.emit(BytecodeOp::StoreVar, Some(var_idx));
                 }
             }
+            OpCode::Jump => {
+                if let Operand::Immediate(LiteralValue::Number(target_addr)) =
+                    instruction.operands[0]
+                {
+                    self.emit(BytecodeOp::Jump, Some(target_addr as usize));
+                }
+            }
+            OpCode::JumpIfFalse => {
+                if let Operand::Immediate(LiteralValue::Number(target_addr)) =
+                    instruction.operands[1]
+                {
+                    self.emit(BytecodeOp::JumpIfFalse, Some(target_addr as usize));
+                }
+            }
             OpCode::Add => self.emit(BytecodeOp::Add, None),
             OpCode::Subtract => self.emit(BytecodeOp::Subtract, None),
             OpCode::Multiply => self.emit(BytecodeOp::Multiply, None),
@@ -78,9 +132,8 @@ impl BytecodeGenerator {
         }
     }
 
-    fn add_constant(&mut self, value: f64) -> usize {
-        // Check if the constant already exists
-        if let Some(idx) = self.constants.iter().position(|&c| c == value) {
+    fn add_constant(&mut self, value: LiteralValue) -> usize {
+        if let Some(idx) = self.constants.iter().position(|c| *c == value) {
             return idx;
         }
 
@@ -90,7 +143,6 @@ impl BytecodeGenerator {
     }
 
     fn add_variable(&mut self, name: &str) -> usize {
-        // Check if the variable already exists
         if let Some(idx) = self.variables.iter().position(|v| v == name) {
             return idx;
         }

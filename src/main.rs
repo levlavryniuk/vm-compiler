@@ -1,11 +1,15 @@
 use codegen::BytecodeGenerator;
+pub mod log;
 use ir::IrGenerator;
 use lexer::Lexer;
+use log::set_log_level;
 use parser::Parser;
-use semantic::TypeChecker;
+use semantic::{Context, TypeChecker};
 use std::{fs::File, io::Read};
 use vm::VM;
 
+pub use crate::log::LogLevel;
+pub use crate::log::{debug, error, info, trace, warn};
 mod ast_node;
 mod codegen;
 mod ir;
@@ -14,8 +18,10 @@ mod parser;
 mod semantic;
 mod tokens;
 mod vm;
+//
 fn main() {
-    let mut file = File::open("bob").unwrap();
+    set_log_level(LogLevel::Debug);
+    let mut file = File::open("bob.deez").unwrap();
 
     let mut buf = String::new();
 
@@ -26,12 +32,14 @@ fn main() {
     let tokens = lexer.tokenize();
 
     let mut parser = Parser::new(tokens);
-
-    let stmts = parser.parse().unwrap();
+    let stmts = parser.parse().expect("Parser sais:");
 
     let mut semantic_checker = TypeChecker::new();
 
-    semantic_checker.check(&stmts).unwrap();
+    let mut ctx = Context::new();
+    semantic_checker
+        .check(&mut ctx, &stmts)
+        .expect("Type checker said:");
 
     let mut ir = IrGenerator::new();
 
@@ -43,5 +51,6 @@ fn main() {
 
     let mut vm = VM::new(&bytecode);
 
-    dbg!(vm.execute(&bytecode));
+    let _ = vm.execute(&bytecode);
+    ()
 }

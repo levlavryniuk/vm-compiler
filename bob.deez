@@ -1,0 +1,4 @@
+fn cock_n_balls(a,b){
+  echo a
+  echo b
+}

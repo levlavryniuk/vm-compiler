@@ -1,0 +1,35 @@
+Let at 1:4 
+
+Identifier("bob") at 1:8 
+
+Equal at 1:11 
+
+String("dee") at 1:16 
+
+If at 5:3 
+
+Identifier("bob") at 5:7 
+
+EqualEqual at 5:10 
+
+String("deez") at 5:17 
+
+LeftBrace at 5:19 
+
+Echo at 7:7 
+
+String("yes branch") at 7:20 
+
+RightBrace at 9:2 
+
+Else at 9:6 
+
+LeftBrace at 9:8 
+
+Echo at 11:7 
+
+String("else branch") at 11:21 
+
+RightBrace at 13:2 
+
+EOF at 15:1 

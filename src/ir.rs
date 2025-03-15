@@ -8,11 +8,25 @@ pub enum OpCode {
     LoadConst,
     LoadVar,
     StoreVar,
+
     Add,
     Subtract,
     Multiply,
     Divide,
+
+    Equals,
+    NotEquals,
+    Greater,
+    Less,
+    GreaterOrEq,
+    LessOrEq,
+
     Negate,
+
+    Echo,
+
+    Jump,
+    JumpIfFalse,
 }
 
 #[derive(Debug, Clone)]
@@ -24,7 +38,7 @@ pub struct Instruction {
 #[derive(Debug, Clone)]
 pub enum Operand {
     Register(usize),
-    Immediate(f64),
+    Immediate(LiteralValue),
     Variable(String),
 }
 
@@ -61,6 +75,12 @@ impl IrGenerator {
             Stmt::Expression { expression } => {
                 self.generate_expression(expression);
             }
+            Stmt::FunctionDeclaration { args, name, body } => {}
+            Stmt::Echo { expression } => {
+                let expr_temp = self.generate_expression(expression);
+
+                self.emit(OpCode::Echo, vec![Operand::Register(expr_temp)]);
+            }
             Stmt::Let { name, initializer } => {
                 if let Some(init) = initializer {
                     let temp = self.generate_expression(init);
@@ -71,6 +91,59 @@ impl IrGenerator {
                             vec![Operand::Variable(name_str.clone()), Operand::Register(temp)],
                         );
                     }
+                }
+            }
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                let condition_temp = self.generate_expression(condition);
+                let jump_if_false_idx = self.instructions.len();
+                self.emit(
+                    OpCode::JumpIfFalse,
+                    vec![
+                        Operand::Register(condition_temp),
+                        Operand::Immediate(LiteralValue::Number(0.)),
+                    ],
+                );
+
+                self.generate_statement(then_branch);
+                if let Some(else_branch) = else_branch {
+                    let jump_end_idx = self.instructions.len();
+                    self.emit(
+                        OpCode::Jump,
+                        vec![Operand::Immediate(LiteralValue::Number(0.0))],
+                    );
+
+                    let else_start_idx = self.instructions.len();
+
+                    if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
+                        self.instructions[jump_if_false_idx].operands[1]
+                    {
+                        *value = else_start_idx as f64;
+                    }
+
+                    self.generate_statement(else_branch);
+
+                    let end_idx = self.instructions.len();
+                    if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
+                        self.instructions[jump_end_idx].operands[0]
+                    {
+                        *value = end_idx as f64;
+                    }
+                } else {
+                    let end_idx = self.instructions.len();
+                    if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
+                        self.instructions[jump_if_false_idx].operands[1]
+                    {
+                        *value = end_idx as f64;
+                    }
+                }
+            }
+            Stmt::Block { statements } => {
+                for st in statements {
+                    self.generate_statement(st);
                 }
             }
         }
@@ -92,6 +165,12 @@ impl IrGenerator {
                     TokenType::Minus => OpCode::Subtract,
                     TokenType::Star => OpCode::Multiply,
                     TokenType::Slash => OpCode::Divide,
+                    TokenType::EqualEqual => OpCode::Equals,
+                    TokenType::BangEqual => OpCode::NotEquals,
+                    TokenType::Greater => OpCode::Greater,
+                    TokenType::GreaterOrEq => OpCode::GreaterOrEq,
+                    TokenType::Less => OpCode::Less,
+                    TokenType::LessOrEq => OpCode::LessOrEq,
                     _ => panic!("Unexpected binary operator"),
                 };
 
@@ -130,10 +209,31 @@ impl IrGenerator {
                 let result_temp = self.new_temp();
 
                 match value {
-                    LiteralValue::Number(num) => {
+                    LiteralValue::Number(_) => {
                         self.emit(
                             OpCode::LoadConst,
-                            vec![Operand::Register(result_temp), Operand::Immediate(*num)],
+                            vec![
+                                Operand::Register(result_temp),
+                                Operand::Immediate(value.clone()),
+                            ],
+                        );
+                    }
+                    LiteralValue::String(_) => {
+                        self.emit(
+                            OpCode::LoadConst,
+                            vec![
+                                Operand::Register(result_temp),
+                                Operand::Immediate(value.clone()),
+                            ],
+                        );
+                    }
+                    LiteralValue::Bool(_) => {
+                        self.emit(
+                            OpCode::LoadConst,
+                            vec![
+                                Operand::Register(result_temp),
+                                Operand::Immediate(value.clone()),
+                            ],
                         );
                     }
                     _ => panic!("Unexpected literal type"),

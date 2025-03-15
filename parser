@@ -1,0 +1,3 @@
+Let { name: Token { token_type: Identifier("bob"), line: 1, column: 8 }, initializer: Some(Literal { value: String("dee") }) } 
+
+If { condition: Binary { left: Variable { name: Token { token_type: Identifier("bob"), line: 5, column: 7 } }, operator: Token { token_type: EqualEqual, line: 5, column: 10 }, right: Literal { value: String("deez") } }, then_branch: Block { statements: [Echo { expression: Literal { value: String("yes branch") } }] }, else_branch: Some(Block { statements: [Echo { expression: Literal { value: String("else branch") } }] }) } 
