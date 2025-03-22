@@ -1,69 +1,348 @@
 
- File path: ./Cargo.toml 
+ File path: ./src/ir.rs 
  
-[package]
-name = "compiler"
-version = "0.1.0"
-edition = "2021"
+use std::collections::HashMap;
 
+use crate::{
+    ast_node::{Expr, LiteralValue, Stmt},
+    tokens::TokenType,
+};
 
- File path: ./src/main.rs 
- 
-use codegen::BytecodeGenerator;
-pub mod log;
-use ir::IrGenerator;
-use lexer::Lexer;
-use log::set_log_level;
-use parser::Parser;
-use semantic::{Context, TypeChecker};
-use std::{fs::File, io::Read};
-use vm::VM;
+#[derive(Debug, Clone)]
+pub enum OpCode {
+    LoadConst,
+    LoadVar,
+    Return,
+    StoreVar,
+    EnterFrame,
+    DeclareVar,
 
-pub use crate::log::LogLevel;
-pub use crate::log::{debug, error, info, trace, warn};
-mod ast_node;
-mod codegen;
-mod ir;
-mod lexer;
-mod parser;
-mod semantic;
-mod tokens;
-mod vm;
-//
-fn main() {
-    set_log_level(LogLevel::Debug);
-    let mut file = File::open("bob.deez").unwrap();
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
 
-    let mut buf = String::new();
+    Equals,
+    NotEquals,
+    Greater,
+    FunctionDeclaration,
+    Less,
+    GreaterOrEq,
+    LessOrEq,
 
-    file.read_to_string(&mut buf).unwrap();
+    Negate,
 
-    let mut lexer = Lexer::new(&buf);
+    Echo,
 
-    let tokens = lexer.tokenize();
+    Call,      // New: Call a function
+    Push,      // New: Push value to stack
+    LoadParam, // New: Load parameter from stack
+    Jump,
+    JumpIfFalse,
+}
 
-    let mut parser = Parser::new(tokens);
-    let stmts = parser.parse().expect("Parser sais:");
+#[derive(Debug, Clone)]
+pub struct Instruction {
+    pub op: OpCode,
+    pub operands: Vec<Operand>,
+}
 
-    let mut semantic_checker = TypeChecker::new();
+#[derive(Debug, Clone)]
+pub enum Operand {
+    Register(usize),
+    Immediate(LiteralValue),
+    Variable(String),
+}
 
-    let mut ctx = Context::new();
-    semantic_checker
-        .check(&mut ctx, &stmts)
-        .expect("Type checker said:");
+#[derive(Debug)]
+pub struct IrProgram {
+    pub instructions: Vec<Instruction>,
+    pub functions: HashMap<String, (usize, usize)>, // name -> (start_address, param_count)
+}
 
-    let mut ir = IrGenerator::new();
+pub struct IrGenerator {
+    instructions: Vec<Instruction>,
+    pub functions: HashMap<String, (usize, usize)>, // name -> (start_address, param_count)
+    temp_counter: usize,
+}
 
-    let ir_program = ir.generate(&stmts);
+impl IrGenerator {
+    pub fn new() -> Self {
+        IrGenerator {
+            instructions: Vec::new(),
+            temp_counter: 0,
+            functions: HashMap::new(),
+        }
+    }
 
-    let mut codegen = BytecodeGenerator::new();
+    pub fn generate(&mut self, statements: &[Stmt]) -> IrProgram {
+        for stmt in statements {
+            self.generate_statement(stmt);
+        }
 
-    let bytecode = codegen.generate(&ir_program);
+        IrProgram {
+            instructions: self.instructions.clone(),
+            functions: self.functions.clone(),
+        }
+    }
 
-    let mut vm = VM::new(&bytecode);
+    fn generate_statement(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Expression { expression } => {
+                self.generate_expression(expression);
+            }
+            Stmt::FunctionDeclaration { args, name, body } => {
+                let function_start = self.instructions.len();
+                self.emit(
+                    OpCode::Jump,
+                    vec![Operand::Immediate(LiteralValue::Number(0.))],
+                );
 
-    let _ = vm.execute(&bytecode);
-    ()
+                self.emit(
+                    OpCode::FunctionDeclaration,
+                    vec![
+                        Operand::Immediate(LiteralValue::String(name.clone())),
+                        Operand::Immediate(LiteralValue::Number(args.len() as f64)),
+                    ],
+                );
+
+                self.generate_statement(body);
+
+                self.emit(OpCode::Return, vec![]);
+
+                let function_end = self.instructions.len();
+
+                if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
+                    self.instructions[function_start].operands[0]
+                {
+                    *value = function_end as f64 - 1.0;
+                }
+
+                self.functions
+                    .insert(name.clone(), (function_start, args.len()));
+            }
+
+            Stmt::Echo { expression } => {
+                let expr_temp = self.generate_expression(expression);
+
+                self.emit(OpCode::Echo, vec![Operand::Register(expr_temp)]);
+            }
+            Stmt::Let { name, initializer } => {
+                if let Some(init) = initializer {
+                    let temp = self.generate_expression(init);
+
+                    if let TokenType::Identifier(name_str) = &name.token_type {
+                        self.emit(
+                            OpCode::StoreVar,
+                            vec![Operand::Variable(name_str.clone()), Operand::Register(temp)],
+                        );
+                    }
+                } else {
+                    if let TokenType::Identifier(name_str) = &name.token_type {
+                        self.emit(
+                            OpCode::DeclareVar,
+                            vec![Operand::Variable(name_str.clone())],
+                        );
+                    }
+                }
+            }
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                let condition_temp = self.generate_expression(condition);
+                let jump_if_false_idx = self.instructions.len();
+                self.emit(
+                    OpCode::JumpIfFalse,
+                    vec![
+                        Operand::Register(condition_temp),
+                        Operand::Immediate(LiteralValue::Number(0.)),
+                    ],
+                );
+
+                self.generate_statement(then_branch);
+                if let Some(else_branch) = else_branch {
+                    let jump_end_idx = self.instructions.len();
+                    self.emit(
+                        OpCode::Jump,
+                        vec![Operand::Immediate(LiteralValue::Number(0.0))],
+                    );
+
+                    let else_start_idx = self.instructions.len();
+
+                    if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
+                        self.instructions[jump_if_false_idx].operands[1]
+                    {
+                        *value = else_start_idx as f64;
+                    }
+
+                    self.generate_statement(else_branch);
+
+                    let end_idx = self.instructions.len();
+                    if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
+                        self.instructions[jump_end_idx].operands[0]
+                    {
+                        *value = end_idx as f64 - 1.0;
+                    }
+                } else {
+                    let end_idx = self.instructions.len();
+                    if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
+                        self.instructions[jump_if_false_idx].operands[1]
+                    {
+                        *value = end_idx as f64 - 1.0;
+                    }
+                }
+            }
+            Stmt::Block { statements } => {
+                for st in statements {
+                    self.generate_statement(st);
+                }
+            }
+        }
+    }
+
+    fn generate_expression(&mut self, expr: &Expr) -> usize {
+        match expr {
+            Expr::Call { callee, arguments } => {
+                // First, evaluate all arguments and push them onto the stack
+                // (in reverse order, so first arg is on top)
+                for arg in arguments.iter().rev() {
+                    let arg_temp = self.generate_expression(arg);
+                    self.emit(OpCode::Push, vec![Operand::Register(arg_temp)]);
+                }
+
+                // Get the function name from the callee
+                // Generate the call instruction
+                let result_temp = self.new_temp();
+                self.emit(
+                    OpCode::Call,
+                    vec![
+                        Operand::Register(result_temp),
+                        Operand::Immediate(LiteralValue::String(callee.clone())),
+                        Operand::Immediate(LiteralValue::Number(arguments.len() as f64)),
+                    ],
+                );
+
+                return result_temp;
+            }
+            Expr::Binary {
+                left,
+                operator,
+                right,
+            } => {
+                let left_temp = self.generate_expression(left);
+                let right_temp = self.generate_expression(right);
+                let result_temp = self.new_temp();
+
+                let op = match operator.token_type {
+                    TokenType::Plus => OpCode::Add,
+                    TokenType::Minus => OpCode::Subtract,
+                    TokenType::Star => OpCode::Multiply,
+                    TokenType::Slash => OpCode::Divide,
+                    TokenType::EqualEqual => OpCode::Equals,
+                    TokenType::BangEqual => OpCode::NotEquals,
+                    TokenType::Greater => OpCode::Greater,
+                    TokenType::GreaterOrEq => OpCode::GreaterOrEq,
+                    TokenType::Less => OpCode::Less,
+                    TokenType::LessOrEq => OpCode::LessOrEq,
+                    _ => panic!("Unexpected binary operator"),
+                };
+
+                self.emit(
+                    op,
+                    vec![
+                        Operand::Register(result_temp),
+                        Operand::Register(left_temp),
+                        Operand::Register(right_temp),
+                    ],
+                );
+
+                result_temp
+            }
+            Expr::Unary { operator, right } => {
+                let right_temp = self.generate_expression(right);
+                let result_temp = self.new_temp();
+
+                match operator.token_type {
+                    TokenType::Minus => {
+                        self.emit(
+                            OpCode::Negate,
+                            vec![
+                                Operand::Register(result_temp),
+                                Operand::Register(right_temp),
+                            ],
+                        );
+                    }
+                    _ => panic!("Unexpected unary operator"),
+                }
+
+                result_temp
+            }
+            Expr::Grouping { expression } => self.generate_expression(expression),
+            Expr::Literal { value } => {
+                let result_temp = self.new_temp();
+
+                match value {
+                    LiteralValue::Number(_) => {
+                        self.emit(
+                            OpCode::LoadConst,
+                            vec![
+                                Operand::Register(result_temp),
+                                Operand::Immediate(value.clone()),
+                            ],
+                        );
+                    }
+                    LiteralValue::String(_) => {
+                        self.emit(
+                            OpCode::LoadConst,
+                            vec![
+                                Operand::Register(result_temp),
+                                Operand::Immediate(value.clone()),
+                            ],
+                        );
+                    }
+                    LiteralValue::Bool(_) => {
+                        self.emit(
+                            OpCode::LoadConst,
+                            vec![
+                                Operand::Register(result_temp),
+                                Operand::Immediate(value.clone()),
+                            ],
+                        );
+                    }
+                    _ => panic!("Unexpected literal type"),
+                }
+
+                result_temp
+            }
+            Expr::Variable { name } => {
+                let result_temp = self.new_temp();
+
+                if let TokenType::Identifier(name_str) = &name.token_type {
+                    self.emit(
+                        OpCode::LoadVar,
+                        vec![
+                            Operand::Register(result_temp),
+                            Operand::Variable(name_str.clone()),
+                        ],
+                    );
+                }
+
+                result_temp
+            }
+        }
+    }
+
+    fn emit(&mut self, op: OpCode, operands: Vec<Operand>) {
+        self.instructions.push(Instruction { op, operands });
+    }
+
+    fn new_temp(&mut self) -> usize {
+        let temp = self.temp_counter;
+        self.temp_counter += 1;
+        temp
+    }
 }
 
  File path: ./src/vm.rs 
@@ -75,18 +354,28 @@ use crate::{debug, error, info, trace};
 pub struct VM {
     constants: Vec<LiteralValue>,
     variables: Vec<LiteralValue>,
+    globals: Vec<LiteralValue>,
     stack: Vec<LiteralValue>,
     ip: usize,
+    fp: usize,
 }
 
+pub struct StackFrame {
+    return_addr: usize,
+    previus_frame_ptr: usize,
+    sp: usize,
+    fp: usize,
+}
 impl VM {
     pub fn new(bytecode: &Bytecode) -> Self {
         info!("VM", "Creating new VM instance");
         VM {
             constants: bytecode.constants.clone(),
             variables: vec![LiteralValue::Number(0.); bytecode.variables.len()],
+            globals: vec![],
             stack: Vec::with_capacity(256),
             ip: 0,
+            fp: 0,
         }
     }
 
@@ -121,6 +410,92 @@ impl VM {
                     let idx = operand.unwrap();
                     debug!("VM", "Loading constant[{}]: {:?}", idx, self.constants[idx]);
                     self.stack.push(self.constants[idx].clone());
+                }
+
+                BytecodeOp::Call => {
+                    let function_addr = operand.unwrap();
+                    debug!("VM", "Calling function at address {}", function_addr);
+
+                    // Save return address (next instruction after this call)
+                    let return_addr = self.ip + 1;
+                    self.stack.push(LiteralValue::Number(return_addr as f64));
+                    debug!("VM", "Saved return address: {}", return_addr);
+
+                    // Save current frame pointer
+                    self.stack.push(LiteralValue::Number(self.fp as f64));
+                    debug!("VM", "Saved frame pointer: {}", self.fp);
+
+                    // Set new frame pointer to current stack position
+                    self.fp = self.stack.len() - 1;
+                    debug!("VM", "New frame pointer set to: {}", self.fp);
+
+                    // Jump to function start
+                    self.ip = function_addr;
+                    continue; // Skip normal ip increment
+                }
+
+                BytecodeOp::Push => {
+                    // Used for pushing function arguments
+                    if let Some(reg_idx) = operand {
+                        debug!("VM", "Pushing variable[{}] to stack", reg_idx);
+                        self.stack.push(self.variables[reg_idx].clone());
+                    }
+                }
+
+                BytecodeOp::LoadParam => {
+                    // Used to access function parameters from within function body
+                    if let Some(param_idx) = operand {
+                        // Parameters are below the frame in reverse order
+                        // fp points to saved old FP, fp-1 points to return address
+                        // First parameter is at fp-2, second at fp-3, etc.
+                        let stack_idx = self.fp - 2 - param_idx;
+
+                        if stack_idx < self.stack.len() {
+                            debug!(
+                                "VM",
+                                "Loading parameter {} from stack position {}", param_idx, stack_idx
+                            );
+                            let param_value = self.stack[stack_idx].clone();
+                            self.stack.push(param_value);
+                        } else {
+                            error!("VM", "Parameter index out of bounds: {}", param_idx);
+                            return Err(format!("Parameter index out of bounds: {}", param_idx));
+                        }
+                    }
+                }
+
+                BytecodeOp::Return => {
+                    // Save return value (if any)
+                    let return_value = if !self.stack.is_empty() {
+                        self.stack.pop().unwrap()
+                    } else {
+                        LiteralValue::Number(0.0)
+                    };
+                    debug!("VM", "Function returning with value: {:?}", return_value);
+
+                    // Restore stack to previous frame
+                    self.stack.truncate(self.fp);
+
+                    // Pop and restore old frame pointer
+                    if let LiteralValue::Number(old_fp) = self.stack.pop().unwrap() {
+                        self.fp = old_fp as usize;
+                        debug!("VM", "Restored frame pointer to: {}", self.fp);
+                    }
+
+                    // Pop and jump to return address
+                    if let LiteralValue::Number(return_addr) = self.stack.pop().unwrap() {
+                        self.ip = return_addr as usize;
+                        debug!("VM", "Jumping to return address: {}", self.ip);
+
+                        // Push return value back on stack
+                        self.stack.push(return_value);
+                        debug!("VM", "Pushed return value onto stack");
+
+                        continue; // Skip normal ip increment
+                    } else {
+                        error!("VM", "Invalid return address on stack");
+                        return Err("Invalid return address on stack".to_string());
+                    }
                 }
                 BytecodeOp::Echo => {
                     let value = self.stack.pop().unwrap();
@@ -217,19 +592,6 @@ impl VM {
                     } else {
                         error!("VM", "Type error: Cannot negate non-numeric value");
                     }
-                }
-                BytecodeOp::Return => {
-                    let result = if self.stack.is_empty() {
-                        debug!("VM", "Return with empty stack, defaulting to 0");
-                        LiteralValue::Number(0.)
-                    } else {
-                        let value = self.stack.pop().unwrap();
-                        debug!("VM", "Return value: {:?}", value);
-                        value
-                    };
-
-                    info!("VM", "Execution completed with result: {:?}", result);
-                    return Ok(result);
                 }
                 BytecodeOp::Jump => {
                     let target = operand.unwrap();
@@ -369,277 +731,866 @@ impl VM {
     }
 }
 
- File path: ./src/ir.rs 
+ File path: ./src/ast_node.rs 
  
-use crate::{
-    ast_node::{Expr, LiteralValue, Stmt},
-    tokens::TokenType,
-};
+use std::fmt::Display;
+
+use crate::tokens::Token;
+
+#[derive(Debug)]
+pub enum Expr {
+    Binary {
+        left: Box<Expr>,
+        operator: Token,
+        right: Box<Expr>,
+    },
+    Unary {
+        operator: Token,
+        right: Box<Expr>,
+    },
+    Grouping {
+        expression: Box<Expr>,
+    },
+    Literal {
+        value: LiteralValue,
+    },
+    Variable {
+        name: Token,
+    },
+    Call {
+        callee: String,
+        arguments: Vec<Expr>,
+    },
+}
 
 #[derive(Debug, Clone)]
-pub enum OpCode {
-    LoadConst,
-    LoadVar,
-    StoreVar,
+pub enum LiteralValue {
+    Number(f64),
+    Bool(bool),
+    String(String),
+    Nil,
+}
+impl PartialOrd for LiteralValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (LiteralValue::Number(num1), LiteralValue::Number(num2)) => num1.partial_cmp(num2),
+            (LiteralValue::String(str1), LiteralValue::String(str2)) => str1.partial_cmp(str2),
+            (LiteralValue::Bool(bool1), LiteralValue::Bool(bool2)) => bool1.partial_cmp(bool2),
+            (LiteralValue::Nil, LiteralValue::Nil) => Some(std::cmp::Ordering::Equal),
 
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
+            _ => None,
+        }
+    }
+}
 
-    Equals,
-    NotEquals,
+impl PartialEq for LiteralValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (LiteralValue::Number(num1), LiteralValue::Number(num2)) => num1 == num2,
+            (LiteralValue::String(str1), LiteralValue::String(str2)) => str1 == str2,
+            (LiteralValue::Bool(bool1), LiteralValue::Bool(bool2)) => bool1 == bool2,
+            (LiteralValue::Nil, LiteralValue::Nil) => true,
+            _ => false,
+        }
+    }
+    fn ne(&self, other: &Self) -> bool {
+        match (self, other) {
+            (LiteralValue::Number(num1), LiteralValue::Number(num2)) => num1 != num2,
+            (LiteralValue::String(str1), LiteralValue::String(str2)) => str1 != str2,
+            (LiteralValue::Bool(bool1), LiteralValue::Bool(bool2)) => bool1 != bool2,
+            (LiteralValue::Nil, LiteralValue::Nil) => false,
+            _ => true,
+        }
+    }
+}
+
+impl Display for LiteralValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bool(b) => write!(f, "{b}"),
+            Self::Number(n) => write!(f, "{n}"),
+            Self::Nil => write!(f, "Nil"),
+            Self::String(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Stmt {
+    Expression {
+        expression: Expr,
+    },
+    If {
+        condition: Expr,
+        then_branch: Box<Stmt>,
+        else_branch: Option<Box<Stmt>>,
+    },
+    Echo {
+        expression: Expr,
+    },
+    Block {
+        statements: Vec<Stmt>,
+    },
+    FunctionDeclaration {
+        args: Vec<Expr>,
+        name: String,
+        body: Box<Stmt>,
+    },
+    Let {
+        name: Token,
+        initializer: Option<Expr>,
+    },
+}
+
+ File path: ./src/main.rs 
+ 
+use codegen::BytecodeGenerator;
+pub mod log;
+use ir::IrGenerator;
+use lexer::Lexer;
+use log::set_log_level;
+use parser::Parser;
+//use semantic::{Context, TypeChecker};
+use std::{fs::File, io::Read};
+use vm::VM;
+
+pub use crate::log::LogLevel;
+pub use crate::log::{debug, error, info, trace, warn};
+mod ast_node;
+mod codegen;
+mod ir;
+mod lexer;
+mod parser;
+//mod semantic;
+mod tokens;
+mod vm;
+//
+fn main() {
+    set_log_level(LogLevel::Trace);
+    let mut file = File::open("bob.deez").unwrap();
+
+    let mut buf = String::new();
+
+    file.read_to_string(&mut buf).unwrap();
+
+    let mut lexer = Lexer::new(&buf);
+
+    let tokens = lexer.tokenize();
+
+    let mut parser = Parser::new(tokens);
+    let stmts = parser.parse().expect("Parser sais:");
+
+    //let mut semantic_checker = TypeChecker::new();
+
+    //let mut ctx = Context::new();
+    //semantic_checker
+    //    .check(&mut ctx, &stmts)
+    //    .expect("Type checker said:");
+
+    let mut ir = IrGenerator::new();
+
+    let ir_program = ir.generate(&stmts);
+
+    let _ = ir_program
+        .instructions
+        .iter()
+        .enumerate()
+        .for_each(|(i, v)| {
+            println!("\nInstruction {}", i);
+            dbg!(v);
+        });
+    dbg!(&ir_program.functions);
+    let mut codegen = BytecodeGenerator::new();
+
+    let bytecode = codegen.generate(&ir_program);
+
+    bytecode.instructions.iter().enumerate().for_each(|(i, v)| {
+        println!("\nInstruction {}", i);
+        dbg!(v);
+    });
+    let mut vm = VM::new(&bytecode);
+
+    let _ = vm.execute(&bytecode);
+    ()
+}
+
+ File path: ./src/tokens.rs 
+ 
+use crate::ast_node::Expr;
+pub struct FunctionCallData {
+    args: Vec<Expr>,
+}
+#[derive(Debug, PartialEq, Clone)]
+pub enum TokenType {
+    // Literals
+    Number(f64),
+    Identifier(String),
+    Bool(bool),
+    String(String),
+
+    // Operators
+    Plus,
+    Minus,
+    Star,
+    Slash,
+
+    //comaprison
+    Equal,
+    BangEqual,
+    EqualEqual,
     Greater,
     Less,
     GreaterOrEq,
     LessOrEq,
 
-    Negate,
+    //logical ops
+    LogicalNot,
 
+    // Delimiters
+    LeftParen,
+    RightParen,
+    LeftBrace,
+    RightBrace,
+    DoubleQuotes,
+
+    FunctionDeclaration,
+    Comma,
+
+    Let,
+    If,
+    Else,
     Echo,
-
-    Jump,
-    JumpIfFalse,
+    // Control
+    EOF,
 }
 
 #[derive(Debug, Clone)]
-pub struct Instruction {
-    pub op: OpCode,
-    pub operands: Vec<Operand>,
+pub struct Token {
+    pub token_type: TokenType,
+    pub line: usize,
+    pub column: usize,
 }
 
-#[derive(Debug, Clone)]
-pub enum Operand {
-    Register(usize),
-    Immediate(LiteralValue),
-    Variable(String),
+ File path: ./src/lexer.rs 
+ 
+use crate::tokens::{Token, TokenType};
+use crate::{debug, error, info, trace};
+
+pub struct Lexer {
+    input: Vec<char>,
+    position: usize,
+    line: usize,
+    column: usize,
 }
 
-#[derive(Debug)]
-pub struct IrProgram {
-    pub instructions: Vec<Instruction>,
-}
-
-pub struct IrGenerator {
-    instructions: Vec<Instruction>,
-    temp_counter: usize,
-}
-
-impl IrGenerator {
-    pub fn new() -> Self {
-        IrGenerator {
-            instructions: Vec::new(),
-            temp_counter: 0,
+impl Lexer {
+    pub fn new(source: &str) -> Self {
+        info!(
+            "Lexer",
+            "Creating new lexer instance with {} chars",
+            source.len()
+        );
+        Lexer {
+            input: source.chars().collect(),
+            position: 0,
+            line: 1,
+            column: 1,
         }
     }
 
-    pub fn generate(&mut self, statements: &[Stmt]) -> IrProgram {
-        for stmt in statements {
-            self.generate_statement(stmt);
+    pub fn tokenize(&mut self) -> Vec<Token> {
+        info!("Lexer", "Starting tokenization");
+        let mut tokens = Vec::new();
+
+        while let Some(token) = self.next_token() {
+            let token_type = token.token_type.clone();
+            debug!(
+                "Lexer",
+                "Found token: {:?} at line {} column {}",
+                token.token_type,
+                token.line,
+                token.column
+            );
+            tokens.push(token);
+            if TokenType::EOF.eq(&token_type) {
+                // if met end of file - finish tokenizing
+                info!("Lexer", "Reached EOF, tokenization complete");
+                break;
+            }
         }
 
-        IrProgram {
+        info!(
+            "Lexer",
+            "Tokenization complete, found {} tokens",
+            tokens.len()
+        );
+        tokens
+    }
+
+    fn next_token(&mut self) -> Option<Token> {
+        trace!(
+            "Lexer",
+            "Looking for next token at position {}",
+            self.position
+        );
+        self.skip_whitespace();
+
+        if self.is_at_end() {
+            debug!("Lexer", "Reached end of input");
+            return Some(self.make_token(TokenType::EOF));
+        }
+
+        // skipped through all the whitespace - start from the first non-whitespace char
+        let c = self.advance();
+        trace!("Lexer", "Processing character: '{}'", c);
+
+        match c {
+            '(' => Some(self.make_token(TokenType::LeftParen)),
+            ')' => Some(self.make_token(TokenType::RightParen)),
+            '{' => Some(self.make_token(TokenType::LeftBrace)),
+            '}' => Some(self.make_token(TokenType::RightBrace)),
+            '+' => Some(self.make_token(TokenType::Plus)),
+            '-' => Some(self.make_token(TokenType::Minus)),
+            '*' => Some(self.make_token(TokenType::Star)),
+            '/' => Some(self.make_token(TokenType::Slash)),
+            ',' => Some(self.make_token(TokenType::Comma)),
+            '!' => {
+                let next = self.peek();
+                trace!(
+                    "Lexer",
+                    "Checking if '!' is followed by '=': next = '{}'",
+                    next
+                );
+                if self.match_char('=') {
+                    Some(self.make_token(TokenType::BangEqual))
+                } else {
+                    Some(self.make_token(TokenType::LogicalNot))
+                }
+            }
+            '<' => {
+                let next = self.peek();
+                trace!(
+                    "Lexer",
+                    "Checking if '<' is followed by '=': next = '{}'",
+                    next
+                );
+                if self.match_char('=') {
+                    Some(self.make_token(TokenType::LessOrEq))
+                } else {
+                    Some(self.make_token(TokenType::Less))
+                }
+            }
+            '>' => {
+                let next = self.peek();
+                trace!(
+                    "Lexer",
+                    "Checking if '>' is followed by '=': next = '{}'",
+                    next
+                );
+                if self.match_char('=') {
+                    Some(self.make_token(TokenType::GreaterOrEq))
+                } else {
+                    Some(self.make_token(TokenType::Greater))
+                }
+            }
+
+            '=' => {
+                let next = self.peek();
+                trace!(
+                    "Lexer",
+                    "Checking if '=' is followed by '=': next = '{}'",
+                    next
+                );
+                if self.match_char('=') {
+                    Some(self.make_token(TokenType::EqualEqual))
+                } else {
+                    Some(self.make_token(TokenType::Equal))
+                }
+            }
+
+            '"' => Some(self.string()),
+
+            '0'..='9' => {
+                self.retreat(); // Go back to reprocess the digit
+                Some(self.number())
+            }
+
+            'a'..='z' | 'A'..='Z' | '_' => {
+                self.retreat(); // Go back to reprocess the letter
+                Some(self.identifier())
+            }
+
+            _ => {
+                error!(
+                    "Lexer",
+                    "Unexpected character: '{}' at line {} column {}", c, self.line, self.column
+                );
+                self.next_token()
+            }
+        }
+    }
+
+    fn string(&mut self) -> Token {
+        debug!(
+            "Lexer",
+            "Processing string literal at line {} column {}", self.line, self.column
+        );
+        let mut contents = String::new();
+        let start_line = self.line;
+        let start_column = self.column;
+
+        while self.peek() != '\"' && !self.is_at_end() {
+            contents.push(self.peek());
+            self.advance();
+        }
+
+        if self.is_at_end() {
+            error!(
+                "Lexer",
+                "Unterminated string starting at line {} column {}", start_line, start_column
+            );
+            // We continue despite the error to avoid crashing the lexer
+        } else {
+            // Consume the closing "
+            self.advance();
+        }
+
+        debug!("Lexer", "String literal: \"{}\"", contents);
+
+        Token {
+            column: start_column,
+            line: start_line,
+            token_type: TokenType::String(contents),
+        }
+    }
+
+    fn number(&mut self) -> Token {
+        debug!(
+            "Lexer",
+            "Processing number at line {} column {}", self.line, self.column
+        );
+        let start_pos = self.position;
+        let start_line = self.line;
+        let start_column = self.column;
+
+        // loop until number is ended. start_pos -> self.position is the "number"
+        while !self.is_at_end() && self.peek().is_ascii_digit() {
+            self.advance();
+        }
+
+        // if prev loop stopped because of non-digit - it is probably a decimal ".",  so skip it
+        // and go back to number proccessing
+        if !self.is_at_end() && self.peek() == '.' && self.peek_next().is_ascii_digit() {
+            trace!("Lexer", "Found decimal point in number");
+            self.advance(); // Consume the '.'
+
+            while !self.is_at_end() && self.peek().is_ascii_digit() {
+                self.advance();
+            }
+        }
+
+        let number_str: String = self.input[start_pos..self.position].iter().collect();
+        let value = match number_str.parse::<f64>() {
+            Ok(v) => {
+                debug!("Lexer", "Parsed number: {}", v);
+                v
+            }
+            Err(e) => {
+                error!("Lexer", "Failed to parse number '{}': {}", number_str, e);
+                0.0 // Default value to avoid crashing
+            }
+        };
+
+        Token {
+            line: start_line,
+            column: start_column,
+            token_type: TokenType::Number(value),
+        }
+    }
+
+    fn identifier(&mut self) -> Token {
+        debug!(
+            "Lexer",
+            "Processing identifier at line {} column {}", self.line, self.column
+        );
+        let start_pos = self.position;
+        let start_line = self.line;
+        let start_column = self.column;
+
+        // if this is a variable, that has chars and numbers and _
+        while !self.is_at_end() && (self.peek().is_alphanumeric() || self.peek() == '_') {
+            self.advance();
+        }
+
+        let identifier: String = self.input[start_pos..self.position].iter().collect();
+        trace!("Lexer", "Identifier or keyword: '{}'", identifier);
+
+        // Check for keywords
+        let token_type = match identifier.as_str() {
+            "let" => TokenType::Let,
+            "if" => TokenType::If,
+            "else" => TokenType::Else,
+            "true" => TokenType::Bool(true),
+            "false" => TokenType::Bool(false),
+            "echo" => TokenType::Echo,
+            "fn" => TokenType::FunctionDeclaration,
+            _ => TokenType::Identifier(identifier),
+        };
+
+        debug!("Lexer", "Identified as: {:?}", token_type);
+
+        Token {
+            line: start_line,
+            column: start_column,
+            token_type,
+        }
+    }
+
+    // Helper methods
+    fn is_at_end(&self) -> bool {
+        self.position >= self.input.len()
+    }
+
+    fn advance(&mut self) -> char {
+        if self.is_at_end() {
+            trace!("Lexer", "Attempted to advance past end of input");
+            return '\0';
+        }
+
+        let c = self.input[self.position];
+        self.position += 1;
+        self.column += 1;
+
+        if c == '\n' {
+            self.line += 1;
+            self.column = 1;
+            trace!("Lexer", "Advanced to new line {}", self.line);
+        }
+
+        c
+    }
+
+    fn retreat(&mut self) {
+        if self.position > 0 {
+            self.position -= 1;
+            self.column -= 1;
+            trace!(
+                "Lexer",
+                "Retreated to position {}, column {}",
+                self.position,
+                self.column
+            );
+        } else {
+            error!("Lexer", "Attempted to retreat before start of input");
+        }
+    }
+
+    fn peek(&self) -> char {
+        if self.is_at_end() {
+            '\0'
+        } else {
+            self.input[self.position]
+        }
+    }
+
+    fn peek_next(&self) -> char {
+        if self.position + 1 >= self.input.len() {
+            '\0'
+        } else {
+            self.input[self.position + 1]
+        }
+    }
+
+    fn match_char(&mut self, expected: char) -> bool {
+        if self.is_at_end() || self.peek() != expected {
+            false
+        } else {
+            self.advance();
+            true
+        }
+    }
+
+    /// Skips all whitespace (' '), tabs ('\t'), empty lines ('\n') and comments
+    fn skip_whitespace(&mut self) {
+        trace!(
+            "Lexer",
+            "Skipping whitespace starting at position {}",
+            self.position
+        );
+        let start_pos = self.position;
+
+        while !self.is_at_end() {
+            match self.peek() {
+                ' ' | '\r' | '\t' => {
+                    self.advance();
+                }
+                '\n' => {
+                    self.line += 1;
+                    self.column = 1;
+                    self.advance();
+                }
+                // Skip comments
+                '/' if self.peek_next() == '/' => {
+                    trace!("Lexer", "Skipping comment at line {}", self.line);
+                    while !self.is_at_end() && self.peek() != '\n' {
+                        self.advance();
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        if self.position > start_pos {
+            trace!(
+                "Lexer",
+                "Skipped {} whitespace characters",
+                self.position - start_pos
+            );
+        }
+    }
+
+    fn make_token(&self, token_type: TokenType) -> Token {
+        trace!(
+            "Lexer",
+            "Creating token: {:?} at line {} column {}",
+            token_type,
+            self.line,
+            self.column
+        );
+        Token {
+            token_type,
+            line: self.line,
+            column: self.column,
+        }
+    }
+}
+
+ File path: ./src/codegen.rs 
+ 
+use std::collections::HashMap;
+
+use crate::{
+    ast_node::LiteralValue,
+    ir::{Instruction, IrProgram, OpCode, Operand},
+};
+
+#[derive(Debug, Clone, Copy)]
+pub enum BytecodeOp {
+    LoadConst,
+    LoadVar,
+    StoreVar,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Negate,
+    Echo,
+    Equals,
+    NotEquals,
+    Return,
+
+    Greater,
+    Less,
+    GreaterOrEq,
+    Call,      // New: Call a function
+    Push,      // New: Push value to stack
+    LoadParam, // New: Load parameter from stack
+    LessOrEq,
+    JumpIfFalse,
+    Jump,
+}
+
+#[derive(Debug)]
+pub struct Bytecode {
+    pub constants: Vec<LiteralValue>,
+    pub variables: Vec<String>,
+    pub functions: HashMap<String, (usize, usize)>, // name -> (start_address, param_count)
+    pub instructions: Vec<(BytecodeOp, Option<usize>)>,
+}
+
+pub struct BytecodeGenerator {
+    constants: Vec<LiteralValue>,
+
+    pub functions: HashMap<String, (usize, usize)>, // name -> (start_address, param_count)
+    variables: Vec<String>,
+    instructions: Vec<(BytecodeOp, Option<usize>)>,
+}
+
+impl BytecodeGenerator {
+    pub fn new() -> Self {
+        BytecodeGenerator {
+            constants: Vec::new(),
+            variables: Vec::new(),
+            instructions: Vec::new(),
+            functions: HashMap::new(),
+        }
+    }
+
+    pub fn generate(&mut self, ir: &IrProgram) -> Bytecode {
+        for instruction in &ir.instructions {
+            self.generate_instruction(instruction);
+        }
+
+        // Add a return instruction at the end
+        self.emit(BytecodeOp::Return, None);
+
+        Bytecode {
+            constants: self.constants.clone(),
+            variables: self.variables.clone(),
+            functions: self.functions.clone(),
             instructions: self.instructions.clone(),
         }
     }
 
-    fn generate_statement(&mut self, stmt: &Stmt) {
-        match stmt {
-            Stmt::Expression { expression } => {
-                self.generate_expression(expression);
-            }
-            Stmt::FunctionDeclaration { args, name, body } => {}
-            Stmt::Echo { expression } => {
-                let expr_temp = self.generate_expression(expression);
-
-                self.emit(OpCode::Echo, vec![Operand::Register(expr_temp)]);
-            }
-            Stmt::Let { name, initializer } => {
-                if let Some(init) = initializer {
-                    let temp = self.generate_expression(init);
-
-                    if let TokenType::Identifier(name_str) = &name.token_type {
-                        self.emit(
-                            OpCode::StoreVar,
-                            vec![Operand::Variable(name_str.clone()), Operand::Register(temp)],
-                        );
-                    }
+    fn generate_instruction(&mut self, instruction: &Instruction) {
+        match instruction.op {
+            OpCode::LoadConst => {
+                if let Operand::Immediate(value) = &instruction.operands[1] {
+                    let const_idx = self.add_constant(value.clone());
+                    self.emit(BytecodeOp::LoadConst, Some(const_idx));
                 }
             }
-            Stmt::If {
-                condition,
-                then_branch,
-                else_branch,
-            } => {
-                let condition_temp = self.generate_expression(condition);
-                let jump_if_false_idx = self.instructions.len();
-                self.emit(
-                    OpCode::JumpIfFalse,
-                    vec![
-                        Operand::Register(condition_temp),
-                        Operand::Immediate(LiteralValue::Number(0.)),
-                    ],
-                );
+            OpCode::FunctionDeclaration => {
+                if let (
+                    Operand::Immediate(LiteralValue::String(name)),
+                    Operand::Immediate(LiteralValue::Number(param_count)),
+                ) = (&instruction.operands[0], &instruction.operands[1])
+                {
+                    // Record the current position as the start of this function
+                    let function_start = self.instructions.len();
 
-                self.generate_statement(then_branch);
-                if let Some(else_branch) = else_branch {
-                    let jump_end_idx = self.instructions.len();
-                    self.emit(
-                        OpCode::Jump,
-                        vec![Operand::Immediate(LiteralValue::Number(0.0))],
-                    );
+                    // Add function entry to our function table
+                    self.functions
+                        .insert(name.clone(), (function_start, *param_count as usize));
+                }
+            }
 
-                    let else_start_idx = self.instructions.len();
+            OpCode::Call => {
+                if let [Operand::Register(result_reg), Operand::Immediate(LiteralValue::String(name)), Operand::Immediate(LiteralValue::Number(_))] =
+                    instruction.operands.as_slice()
+                {
+                    if let Some((function_addr, _)) = self.functions.get(name) {
+                        let return_addr = self.instructions.len();
+                        // Generate call instruction with function address
+                        // VM jumps to the function code
+                        self.emit(BytecodeOp::Call, Some(*function_addr));
 
-                    if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
-                        self.instructions[jump_if_false_idx].operands[1]
-                    {
-                        *value = else_start_idx as f64;
-                    }
-
-                    self.generate_statement(else_branch);
-
-                    let end_idx = self.instructions.len();
-                    if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
-                        self.instructions[jump_end_idx].operands[0]
-                    {
-                        *value = end_idx as f64;
+                        // After return, the result will be on top of stack
+                        // We need to store it in the result register
+                        self.emit(BytecodeOp::StoreVar, Some(*result_reg));
+                    } else {
+                        panic!("Function not found: {}", name);
                     }
                 } else {
-                    let end_idx = self.instructions.len();
-                    if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
-                        self.instructions[jump_if_false_idx].operands[1]
-                    {
-                        *value = end_idx as f64;
-                    }
+                    panic!("Invalid operands for Call instruction");
                 }
             }
-            Stmt::Block { statements } => {
-                for st in statements {
-                    self.generate_statement(st);
+
+            OpCode::Return => {
+                self.emit(BytecodeOp::Return, None);
+            }
+
+            OpCode::LoadParam => {
+                if let Operand::Immediate(LiteralValue::Number(idx)) = &instruction.operands[1] {
+                    // Load parameter at index from stack into register
+                    self.emit(BytecodeOp::LoadParam, Some(*idx as usize));
                 }
             }
+
+            OpCode::Push => {
+                if let Operand::Register(reg) = instruction.operands[0] {
+                    // Push value from register to stack for function call
+                    self.emit(BytecodeOp::Push, Some(reg));
+                }
+            }
+            OpCode::DeclareVar => {
+                if let Operand::Immediate(LiteralValue::String(s)) = &instruction.operands[0] {
+                    let var_idx = self.add_variable(s);
+                    self.emit(BytecodeOp::StoreVar, Some(var_idx));
+                }
+            }
+
+            OpCode::Equals => {
+                self.emit(BytecodeOp::Equals, None);
+            }
+
+            OpCode::LessOrEq => {
+                self.emit(BytecodeOp::LessOrEq, None);
+            }
+
+            OpCode::Less => {
+                self.emit(BytecodeOp::Less, None);
+            }
+
+            OpCode::GreaterOrEq => {
+                self.emit(BytecodeOp::GreaterOrEq, None);
+            }
+
+            OpCode::Greater => {
+                self.emit(BytecodeOp::Greater, None);
+            }
+            OpCode::NotEquals => {
+                self.emit(BytecodeOp::NotEquals, None);
+            }
+            OpCode::Echo => self.emit(BytecodeOp::Echo, None),
+
+            OpCode::LoadVar => {
+                if let Operand::Variable(ref name) = instruction.operands[1] {
+                    let var_idx = self.add_variable(name);
+                    self.emit(BytecodeOp::LoadVar, Some(var_idx));
+                }
+            }
+            OpCode::StoreVar => {
+                if let Operand::Variable(ref name) = instruction.operands[0] {
+                    let var_idx = self.add_variable(name);
+                    self.emit(BytecodeOp::StoreVar, Some(var_idx));
+                }
+            }
+            OpCode::Jump => {
+                if let Operand::Immediate(LiteralValue::Number(target_addr)) =
+                    instruction.operands[0]
+                {
+                    self.emit(BytecodeOp::Jump, Some(target_addr as usize));
+                }
+            }
+            OpCode::JumpIfFalse => {
+                if let Operand::Immediate(LiteralValue::Number(target_addr)) =
+                    instruction.operands[1]
+                {
+                    self.emit(BytecodeOp::JumpIfFalse, Some(target_addr as usize));
+                }
+            }
+            OpCode::Add => self.emit(BytecodeOp::Add, None),
+            OpCode::Subtract => self.emit(BytecodeOp::Subtract, None),
+            OpCode::Multiply => self.emit(BytecodeOp::Multiply, None),
+            OpCode::Divide => self.emit(BytecodeOp::Divide, None),
+            OpCode::Negate => self.emit(BytecodeOp::Negate, None),
+            _ => (),
         }
     }
 
-    fn generate_expression(&mut self, expr: &Expr) -> usize {
-        match expr {
-            Expr::Binary {
-                left,
-                operator,
-                right,
-            } => {
-                let left_temp = self.generate_expression(left);
-                let right_temp = self.generate_expression(right);
-                let result_temp = self.new_temp();
-
-                let op = match operator.token_type {
-                    TokenType::Plus => OpCode::Add,
-                    TokenType::Minus => OpCode::Subtract,
-                    TokenType::Star => OpCode::Multiply,
-                    TokenType::Slash => OpCode::Divide,
-                    TokenType::EqualEqual => OpCode::Equals,
-                    TokenType::BangEqual => OpCode::NotEquals,
-                    TokenType::Greater => OpCode::Greater,
-                    TokenType::GreaterOrEq => OpCode::GreaterOrEq,
-                    TokenType::Less => OpCode::Less,
-                    TokenType::LessOrEq => OpCode::LessOrEq,
-                    _ => panic!("Unexpected binary operator"),
-                };
-
-                self.emit(
-                    op,
-                    vec![
-                        Operand::Register(result_temp),
-                        Operand::Register(left_temp),
-                        Operand::Register(right_temp),
-                    ],
-                );
-
-                result_temp
-            }
-            Expr::Unary { operator, right } => {
-                let right_temp = self.generate_expression(right);
-                let result_temp = self.new_temp();
-
-                match operator.token_type {
-                    TokenType::Minus => {
-                        self.emit(
-                            OpCode::Negate,
-                            vec![
-                                Operand::Register(result_temp),
-                                Operand::Register(right_temp),
-                            ],
-                        );
-                    }
-                    _ => panic!("Unexpected unary operator"),
-                }
-
-                result_temp
-            }
-            Expr::Grouping { expression } => self.generate_expression(expression),
-            Expr::Literal { value } => {
-                let result_temp = self.new_temp();
-
-                match value {
-                    LiteralValue::Number(_) => {
-                        self.emit(
-                            OpCode::LoadConst,
-                            vec![
-                                Operand::Register(result_temp),
-                                Operand::Immediate(value.clone()),
-                            ],
-                        );
-                    }
-                    LiteralValue::String(_) => {
-                        self.emit(
-                            OpCode::LoadConst,
-                            vec![
-                                Operand::Register(result_temp),
-                                Operand::Immediate(value.clone()),
-                            ],
-                        );
-                    }
-                    LiteralValue::Bool(_) => {
-                        self.emit(
-                            OpCode::LoadConst,
-                            vec![
-                                Operand::Register(result_temp),
-                                Operand::Immediate(value.clone()),
-                            ],
-                        );
-                    }
-                    _ => panic!("Unexpected literal type"),
-                }
-
-                result_temp
-            }
-            Expr::Variable { name } => {
-                let result_temp = self.new_temp();
-
-                if let TokenType::Identifier(name_str) = &name.token_type {
-                    self.emit(
-                        OpCode::LoadVar,
-                        vec![
-                            Operand::Register(result_temp),
-                            Operand::Variable(name_str.clone()),
-                        ],
-                    );
-                }
-
-                result_temp
-            }
+    fn add_constant(&mut self, value: LiteralValue) -> usize {
+        if let Some(idx) = self.constants.iter().position(|c| *c == value) {
+            return idx;
         }
+
+        let idx = self.constants.len();
+        self.constants.push(value);
+        idx
     }
 
-    fn emit(&mut self, op: OpCode, operands: Vec<Operand>) {
-        self.instructions.push(Instruction { op, operands });
+    fn add_variable(&mut self, name: &str) -> usize {
+        if let Some(idx) = self.variables.iter().position(|v| v == name) {
+            return idx;
+        }
+
+        let idx = self.variables.len();
+        self.variables.push(name.to_string());
+        idx
     }
 
-    fn new_temp(&mut self) -> usize {
-        let temp = self.temp_counter;
-        self.temp_counter += 1;
-        temp
+    fn emit(&mut self, op: BytecodeOp, operand: Option<usize>) {
+        self.instructions.push((op, operand));
     }
 }
 
@@ -853,811 +1804,11 @@ impl TypeChecker {
     }
 }
 
- File path: ./src/codegen.rs 
- 
-use crate::{
-    ast_node::LiteralValue,
-    ir::{Instruction, IrProgram, OpCode, Operand},
-};
-
-#[derive(Debug, Clone, Copy)]
-pub enum BytecodeOp {
-    LoadConst,
-    LoadVar,
-    StoreVar,
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
-    Negate,
-    Echo,
-    Equals,
-    NotEquals,
-    Return,
-
-    Greater,
-    Less,
-    GreaterOrEq,
-    LessOrEq,
-    JumpIfFalse,
-    Jump,
-}
-
-#[derive(Debug)]
-pub struct Bytecode {
-    pub constants: Vec<LiteralValue>,
-    pub variables: Vec<String>,
-    pub instructions: Vec<(BytecodeOp, Option<usize>)>,
-}
-
-pub struct BytecodeGenerator {
-    constants: Vec<LiteralValue>,
-    variables: Vec<String>,
-    instructions: Vec<(BytecodeOp, Option<usize>)>,
-}
-
-impl BytecodeGenerator {
-    pub fn new() -> Self {
-        BytecodeGenerator {
-            constants: Vec::new(),
-            variables: Vec::new(),
-            instructions: Vec::new(),
-        }
-    }
-
-    pub fn generate(&mut self, ir: &IrProgram) -> Bytecode {
-        for instruction in &ir.instructions {
-            self.generate_instruction(instruction);
-        }
-
-        // Add a return instruction at the end
-        self.emit(BytecodeOp::Return, None);
-
-        Bytecode {
-            constants: self.constants.clone(),
-            variables: self.variables.clone(),
-            instructions: self.instructions.clone(),
-        }
-    }
-
-    fn generate_instruction(&mut self, instruction: &Instruction) {
-        match instruction.op {
-            OpCode::LoadConst => {
-                if let Operand::Immediate(value) = &instruction.operands[1] {
-                    let const_idx = self.add_constant(value.clone());
-                    self.emit(BytecodeOp::LoadConst, Some(const_idx));
-                }
-            }
-
-            OpCode::Equals => {
-                self.emit(BytecodeOp::Equals, None);
-            }
-
-            OpCode::LessOrEq => {
-                self.emit(BytecodeOp::LessOrEq, None);
-            }
-
-            OpCode::Less => {
-                self.emit(BytecodeOp::Less, None);
-            }
-
-            OpCode::GreaterOrEq => {
-                self.emit(BytecodeOp::GreaterOrEq, None);
-            }
-
-            OpCode::Greater => {
-                self.emit(BytecodeOp::Greater, None);
-            }
-            OpCode::NotEquals => {
-                self.emit(BytecodeOp::NotEquals, None);
-            }
-            OpCode::Echo => self.emit(BytecodeOp::Echo, None),
-
-            OpCode::LoadVar => {
-                if let Operand::Variable(ref name) = instruction.operands[1] {
-                    let var_idx = self.add_variable(name);
-                    self.emit(BytecodeOp::LoadVar, Some(var_idx));
-                }
-            }
-            OpCode::StoreVar => {
-                if let Operand::Variable(ref name) = instruction.operands[0] {
-                    let var_idx = self.add_variable(name);
-                    self.emit(BytecodeOp::StoreVar, Some(var_idx));
-                }
-            }
-            OpCode::Jump => {
-                if let Operand::Immediate(LiteralValue::Number(target_addr)) =
-                    instruction.operands[0]
-                {
-                    self.emit(BytecodeOp::Jump, Some(target_addr as usize));
-                }
-            }
-            OpCode::JumpIfFalse => {
-                if let Operand::Immediate(LiteralValue::Number(target_addr)) =
-                    instruction.operands[1]
-                {
-                    self.emit(BytecodeOp::JumpIfFalse, Some(target_addr as usize));
-                }
-            }
-            OpCode::Add => self.emit(BytecodeOp::Add, None),
-            OpCode::Subtract => self.emit(BytecodeOp::Subtract, None),
-            OpCode::Multiply => self.emit(BytecodeOp::Multiply, None),
-            OpCode::Divide => self.emit(BytecodeOp::Divide, None),
-            OpCode::Negate => self.emit(BytecodeOp::Negate, None),
-        }
-    }
-
-    fn add_constant(&mut self, value: LiteralValue) -> usize {
-        if let Some(idx) = self.constants.iter().position(|c| *c == value) {
-            return idx;
-        }
-
-        let idx = self.constants.len();
-        self.constants.push(value);
-        idx
-    }
-
-    fn add_variable(&mut self, name: &str) -> usize {
-        if let Some(idx) = self.variables.iter().position(|v| v == name) {
-            return idx;
-        }
-
-        let idx = self.variables.len();
-        self.variables.push(name.to_string());
-        idx
-    }
-
-    fn emit(&mut self, op: BytecodeOp, operand: Option<usize>) {
-        self.instructions.push((op, operand));
-    }
-}
-
- File path: ./src/lexer.rs 
- 
-use crate::tokens::{Token, TokenType};
-use crate::{debug, error, info, trace};
-
-pub struct Lexer {
-    input: Vec<char>,
-    position: usize,
-    line: usize,
-    column: usize,
-}
-
-impl Lexer {
-    pub fn new(source: &str) -> Self {
-        info!(
-            "Lexer",
-            "Creating new lexer instance with {} chars",
-            source.len()
-        );
-        Lexer {
-            input: source.chars().collect(),
-            position: 0,
-            line: 1,
-            column: 1,
-        }
-    }
-
-    pub fn tokenize(&mut self) -> Vec<Token> {
-        info!("Lexer", "Starting tokenization");
-        let mut tokens = Vec::new();
-
-        while let Some(token) = self.next_token() {
-            let token_type = token.token_type.clone();
-            debug!(
-                "Lexer",
-                "Found token: {:?} at line {} column {}",
-                token.token_type,
-                token.line,
-                token.column
-            );
-            tokens.push(token);
-            if TokenType::EOF.eq(&token_type) {
-                // if met end of file - finish tokenizing
-                info!("Lexer", "Reached EOF, tokenization complete");
-                break;
-            }
-        }
-
-        info!(
-            "Lexer",
-            "Tokenization complete, found {} tokens",
-            tokens.len()
-        );
-        tokens
-    }
-
-    fn next_token(&mut self) -> Option<Token> {
-        trace!(
-            "Lexer",
-            "Looking for next token at position {}",
-            self.position
-        );
-        self.skip_whitespace();
-
-        if self.is_at_end() {
-            debug!("Lexer", "Reached end of input");
-            return Some(self.make_token(TokenType::EOF));
-        }
-
-        // skipped through all the whitespace - start from the first non-whitespace char
-        let c = self.advance();
-        trace!("Lexer", "Processing character: '{}'", c);
-
-        match c {
-            '(' => Some(self.make_token(TokenType::LeftParen)),
-            ')' => Some(self.make_token(TokenType::RightParen)),
-            '{' => Some(self.make_token(TokenType::LeftBrace)),
-            '}' => Some(self.make_token(TokenType::RightBrace)),
-            '+' => Some(self.make_token(TokenType::Plus)),
-            '-' => Some(self.make_token(TokenType::Minus)),
-            '*' => Some(self.make_token(TokenType::Star)),
-            '/' => Some(self.make_token(TokenType::Slash)),
-            ',' => Some(self.make_token(TokenType::Comma)),
-            '!' => {
-                let next = self.peek();
-                trace!(
-                    "Lexer",
-                    "Checking if '!' is followed by '=': next = '{}'",
-                    next
-                );
-                if self.match_char('=') {
-                    Some(self.make_token(TokenType::BangEqual))
-                } else {
-                    Some(self.make_token(TokenType::LogicalNot))
-                }
-            }
-            '<' => {
-                let next = self.peek();
-                trace!(
-                    "Lexer",
-                    "Checking if '<' is followed by '=': next = '{}'",
-                    next
-                );
-                if self.match_char('=') {
-                    Some(self.make_token(TokenType::LessOrEq))
-                } else {
-                    Some(self.make_token(TokenType::Less))
-                }
-            }
-            '>' => {
-                let next = self.peek();
-                trace!(
-                    "Lexer",
-                    "Checking if '>' is followed by '=': next = '{}'",
-                    next
-                );
-                if self.match_char('=') {
-                    Some(self.make_token(TokenType::GreaterOrEq))
-                } else {
-                    Some(self.make_token(TokenType::Greater))
-                }
-            }
-
-            '=' => {
-                let next = self.peek();
-                trace!(
-                    "Lexer",
-                    "Checking if '=' is followed by '=': next = '{}'",
-                    next
-                );
-                if self.match_char('=') {
-                    Some(self.make_token(TokenType::EqualEqual))
-                } else {
-                    Some(self.make_token(TokenType::Equal))
-                }
-            }
-
-            '"' => Some(self.string()),
-
-            '0'..='9' => {
-                self.retreat(); // Go back to reprocess the digit
-                Some(self.number())
-            }
-
-            'a'..='z' | 'A'..='Z' | '_' => {
-                self.retreat(); // Go back to reprocess the letter
-                Some(self.identifier())
-            }
-
-            _ => {
-                error!(
-                    "Lexer",
-                    "Unexpected character: '{}' at line {} column {}", c, self.line, self.column
-                );
-                self.next_token()
-            }
-        }
-    }
-
-    fn string(&mut self) -> Token {
-        debug!(
-            "Lexer",
-            "Processing string literal at line {} column {}", self.line, self.column
-        );
-        let mut contents = String::new();
-        let start_line = self.line;
-        let start_column = self.column;
-
-        while self.peek() != '\"' && !self.is_at_end() {
-            contents.push(self.peek());
-            self.advance();
-        }
-
-        if self.is_at_end() {
-            error!(
-                "Lexer",
-                "Unterminated string starting at line {} column {}", start_line, start_column
-            );
-            // We continue despite the error to avoid crashing the lexer
-        } else {
-            // Consume the closing "
-            self.advance();
-        }
-
-        debug!("Lexer", "String literal: \"{}\"", contents);
-
-        let token = Token {
-            column: start_column,
-            line: start_line,
-            token_type: TokenType::String(contents),
-        };
-
-        token
-    }
-
-    fn number(&mut self) -> Token {
-        debug!(
-            "Lexer",
-            "Processing number at line {} column {}", self.line, self.column
-        );
-        let start_pos = self.position;
-        let start_line = self.line;
-        let start_column = self.column;
-
-        // loop until number is ended. start_pos -> self.position is the "number"
-        while !self.is_at_end() && self.peek().is_digit(10) {
-            self.advance();
-        }
-
-        // if prev loop stopped because of non-digit - it is probably a decimal ".",  so skip it
-        // and go back to number proccessing
-        if !self.is_at_end() && self.peek() == '.' && self.peek_next().is_digit(10) {
-            trace!("Lexer", "Found decimal point in number");
-            self.advance(); // Consume the '.'
-
-            while !self.is_at_end() && self.peek().is_digit(10) {
-                self.advance();
-            }
-        }
-
-        let number_str: String = self.input[start_pos..self.position].iter().collect();
-        let value = match number_str.parse::<f64>() {
-            Ok(v) => {
-                debug!("Lexer", "Parsed number: {}", v);
-                v
-            }
-            Err(e) => {
-                error!("Lexer", "Failed to parse number '{}': {}", number_str, e);
-                0.0 // Default value to avoid crashing
-            }
-        };
-
-        Token {
-            line: start_line,
-            column: start_column,
-            token_type: TokenType::Number(value),
-        }
-    }
-
-    fn identifier(&mut self) -> Token {
-        debug!(
-            "Lexer",
-            "Processing identifier at line {} column {}", self.line, self.column
-        );
-        let start_pos = self.position;
-        let start_line = self.line;
-        let start_column = self.column;
-
-        // if this is a variable, that has chars and numbers and _
-        while !self.is_at_end() && (self.peek().is_alphanumeric() || self.peek() == '_') {
-            self.advance();
-        }
-
-        let identifier: String = self.input[start_pos..self.position].iter().collect();
-        trace!("Lexer", "Identifier or keyword: '{}'", identifier);
-
-        // Check for keywords
-        let token_type = match identifier.as_str() {
-            "let" => TokenType::Let,
-            "if" => TokenType::If,
-            "else" => TokenType::Else,
-            "true" => TokenType::Bool(true),
-            "false" => TokenType::Bool(false),
-            "echo" => TokenType::Echo,
-            "fn" => TokenType::FunctionDeclaration,
-            _ => TokenType::Identifier(identifier),
-        };
-
-        debug!("Lexer", "Identified as: {:?}", token_type);
-
-        Token {
-            line: start_line,
-            column: start_column,
-            token_type,
-        }
-    }
-
-    // Helper methods
-    fn is_at_end(&self) -> bool {
-        self.position >= self.input.len()
-    }
-
-    fn advance(&mut self) -> char {
-        if self.is_at_end() {
-            trace!("Lexer", "Attempted to advance past end of input");
-            return '\0';
-        }
-
-        let c = self.input[self.position];
-        self.position += 1;
-        self.column += 1;
-
-        if c == '\n' {
-            self.line += 1;
-            self.column = 1;
-            trace!("Lexer", "Advanced to new line {}", self.line);
-        }
-
-        c
-    }
-
-    fn retreat(&mut self) {
-        if self.position > 0 {
-            self.position -= 1;
-            self.column -= 1;
-            trace!(
-                "Lexer",
-                "Retreated to position {}, column {}",
-                self.position,
-                self.column
-            );
-        } else {
-            error!("Lexer", "Attempted to retreat before start of input");
-        }
-    }
-
-    fn peek(&self) -> char {
-        if self.is_at_end() {
-            '\0'
-        } else {
-            self.input[self.position]
-        }
-    }
-
-    fn peek_next(&self) -> char {
-        if self.position + 1 >= self.input.len() {
-            '\0'
-        } else {
-            self.input[self.position + 1]
-        }
-    }
-
-    fn match_char(&mut self, expected: char) -> bool {
-        if self.is_at_end() || self.peek() != expected {
-            false
-        } else {
-            self.advance();
-            true
-        }
-    }
-
-    /// Skips all whitespace (' '), tabs ('\t'), empty lines ('\n') and comments
-    fn skip_whitespace(&mut self) {
-        trace!(
-            "Lexer",
-            "Skipping whitespace starting at position {}",
-            self.position
-        );
-        let start_pos = self.position;
-
-        while !self.is_at_end() {
-            match self.peek() {
-                ' ' | '\r' | '\t' => {
-                    self.advance();
-                }
-                '\n' => {
-                    self.line += 1;
-                    self.column = 1;
-                    self.advance();
-                }
-                // Skip comments
-                '/' if self.peek_next() == '/' => {
-                    trace!("Lexer", "Skipping comment at line {}", self.line);
-                    while !self.is_at_end() && self.peek() != '\n' {
-                        self.advance();
-                    }
-                }
-                _ => break,
-            }
-        }
-
-        if self.position > start_pos {
-            trace!(
-                "Lexer",
-                "Skipped {} whitespace characters",
-                self.position - start_pos
-            );
-        }
-    }
-
-    fn make_token(&self, token_type: TokenType) -> Token {
-        trace!(
-            "Lexer",
-            "Creating token: {:?} at line {} column {}",
-            token_type,
-            self.line,
-            self.column
-        );
-        Token {
-            token_type,
-            line: self.line,
-            column: self.column,
-        }
-    }
-}
-
- File path: ./src/log.rs 
- 
-use std::fmt::Display;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-// ANSI color codes
-pub const RED: &str = "\x1b[31m";
-pub const YELLOW: &str = "\x1b[33m";
-pub const GREEN: &str = "\x1b[32m";
-pub const BLUE: &str = "\x1b[34m";
-pub const MAGENTA: &str = "\x1b[35m";
-pub const CYAN: &str = "\x1b[36m";
-pub const RESET: &str = "\x1b[0m";
-pub const BOLD: &str = "\x1b[1m";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum LogLevel {
-    Off,
-    Error,
-    Warning,
-    Info,
-    Debug,
-    Trace,
-}
-
-static CURRENT_LOG_LEVEL: AtomicUsize = AtomicUsize::new(LogLevel::Info as usize);
-
-pub fn set_log_level(level: LogLevel) {
-    CURRENT_LOG_LEVEL.store(level as usize, Ordering::SeqCst);
-}
-
-pub fn get_log_level() -> LogLevel {
-    match CURRENT_LOG_LEVEL.load(Ordering::SeqCst) {
-        0 => LogLevel::Off,
-        1 => LogLevel::Error,
-        2 => LogLevel::Warning,
-        3 => LogLevel::Info,
-        4 => LogLevel::Debug,
-        _ => LogLevel::Trace,
-    }
-}
-
-pub fn is_enabled(level: LogLevel) -> bool {
-    level as usize <= CURRENT_LOG_LEVEL.load(Ordering::SeqCst)
-}
-
-fn log_message(level: LogLevel, component: &str, message: &str) {
-    if !is_enabled(level) {
-        return;
-    }
-
-    let (level_name, color) = match level {
-        LogLevel::Off => unreachable!(),
-        LogLevel::Error => ("ERROR", RED),
-        LogLevel::Warning => ("WARN ", YELLOW),
-        LogLevel::Info => ("INFO ", GREEN),
-        LogLevel::Debug => ("DEBUG", BLUE),
-        LogLevel::Trace => ("TRACE", MAGENTA),
-    };
-
-    eprintln!(
-        "{}{}[{}]{} {}{}[{}]{} {}",
-        color, BOLD, level_name, RESET, CYAN, BOLD, component, RESET, message
-    );
-}
-
-pub fn error(component: &str, message: impl Display) {
-    log_message(LogLevel::Error, component, &format!("{message}"));
-}
-
-pub fn warn(component: &str, message: impl Display) {
-    log_message(LogLevel::Warning, component, &format!("{message}"));
-}
-
-pub fn info(component: &str, message: impl Display) {
-    log_message(LogLevel::Info, component, &format!("{message}"));
-}
-
-pub fn debug(component: &str, message: impl Display) {
-    log_message(LogLevel::Debug, component, &format!("{message}"));
-}
-
-pub fn trace(component: &str, message: impl Display) {
-    log_message(LogLevel::Trace, component, &format!("{message}"));
-}
-
-#[macro_export]
-macro_rules! log_if {
-    ($level:expr, $component:expr, $($arg:tt)*) => {
-        if $crate::log::is_enabled($level) {
-            let message = format!($($arg)*);
-            match $level {
-                $crate::log::LogLevel::Error => $crate::log::error($component, message),
-                $crate::log::LogLevel::Warning => $crate::log::warn($component, message),
-                $crate::log::LogLevel::Info => $crate::log::info($component, message),
-                $crate::log::LogLevel::Debug => $crate::log::debug($component, message),
-                $crate::log::LogLevel::Trace => $crate::log::trace($component, message),
-                _ => {},
-            }
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! error {
-    ($component:expr, $($arg:tt)*) => {
-        $crate::log_if!($crate::log::LogLevel::Error, $component, $($arg)*)
-    };
-}
-
-#[macro_export]
-macro_rules! warn {
-    ($component:expr, $($arg:tt)*) => {
-        $crate::log_if!($crate::log::LogLevel::Warning, $component, $($arg)*)
-    };
-}
-
-#[macro_export]
-macro_rules! info {
-    ($component:expr, $($arg:tt)*) => {
-        $crate::log_if!($crate::log::LogLevel::Info, $component, $($arg)*)
-    };
-}
-
-#[macro_export]
-macro_rules! debug {
-    ($component:expr, $($arg:tt)*) => {
-        $crate::log_if!($crate::log::LogLevel::Debug, $component, $($arg)*)
-    };
-}
-
-#[macro_export]
-macro_rules! trace {
-    ($component:expr, $($arg:tt)*) => {
-        $crate::log_if!($crate::log::LogLevel::Trace, $component, $($arg)*)
-    };
-}
-
- File path: ./src/ast_node.rs 
- 
-use std::fmt::Display;
-
-use crate::tokens::Token;
-
-#[derive(Debug)]
-pub enum Expr {
-    Binary {
-        left: Box<Expr>,
-        operator: Token,
-        right: Box<Expr>,
-    },
-    Unary {
-        operator: Token,
-        right: Box<Expr>,
-    },
-    Grouping {
-        expression: Box<Expr>,
-    },
-    Literal {
-        value: LiteralValue,
-    },
-    Variable {
-        name: Token,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub enum LiteralValue {
-    Number(f64),
-    Bool(bool),
-    String(String),
-    Nil,
-}
-impl PartialOrd for LiteralValue {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match (self, other) {
-            (LiteralValue::Number(num1), LiteralValue::Number(num2)) => num1.partial_cmp(num2),
-            (LiteralValue::String(str1), LiteralValue::String(str2)) => str1.partial_cmp(str2),
-            (LiteralValue::Bool(bool1), LiteralValue::Bool(bool2)) => bool1.partial_cmp(bool2),
-            (LiteralValue::Nil, LiteralValue::Nil) => Some(std::cmp::Ordering::Equal),
-
-            _ => None,
-        }
-    }
-}
-
-impl PartialEq for LiteralValue {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (LiteralValue::Number(num1), LiteralValue::Number(num2)) => num1 == num2,
-            (LiteralValue::String(str1), LiteralValue::String(str2)) => str1 == str2,
-            (LiteralValue::Bool(bool1), LiteralValue::Bool(bool2)) => bool1 == bool2,
-            (LiteralValue::Nil, LiteralValue::Nil) => true,
-            _ => false,
-        }
-    }
-    fn ne(&self, other: &Self) -> bool {
-        match (self, other) {
-            (LiteralValue::Number(num1), LiteralValue::Number(num2)) => num1 != num2,
-            (LiteralValue::String(str1), LiteralValue::String(str2)) => str1 != str2,
-            (LiteralValue::Bool(bool1), LiteralValue::Bool(bool2)) => bool1 != bool2,
-            (LiteralValue::Nil, LiteralValue::Nil) => false,
-            _ => true,
-        }
-    }
-}
-
-impl Display for LiteralValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Bool(b) => write!(f, "{b}"),
-            Self::Number(n) => write!(f, "{n}"),
-            Self::Nil => write!(f, "Nil"),
-            Self::String(s) => write!(f, "{s}"),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum Stmt {
-    Expression {
-        expression: Expr,
-    },
-    If {
-        condition: Expr,
-        then_branch: Box<Stmt>,
-        else_branch: Option<Box<Stmt>>,
-    },
-    Echo {
-        expression: Expr,
-    },
-    Block {
-        statements: Vec<Stmt>,
-    },
-    FunctionDeclaration {
-        args: Vec<Expr>,
-        name: String,
-        body: Box<Stmt>,
-    },
-    Let {
-        name: Token,
-        initializer: Option<Expr>,
-    },
-}
-
  File path: ./src/parser.rs 
  
 use crate::ast_node::*;
 use crate::tokens::*;
-use crate::{debug, error, info, trace, warn};
+use crate::{debug, error, info, trace};
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -2007,6 +2158,56 @@ impl Parser {
         }
     }
 
+    fn function_call(&mut self) -> Result<Expr, String> {
+        let expr = self.equality()?;
+
+        if let Expr::Variable {
+            name:
+                Token {
+                    token_type: TokenType::Identifier(name),
+                    ..
+                },
+        } = &expr
+        {
+            if self.check(|t| *t == TokenType::LeftParen) {
+                self.advance(); // Consume the left paren
+                debug!("Parser", "Parsing function call arguments");
+                let mut args = Vec::new();
+
+                while !self.match_token(TokenType::RightParen) {
+                    trace!("Parser", "Parsing function call argument");
+                    let arg = match self.expression() {
+                        Ok(expr) => {
+                            debug!("Parser", "Added function argument: {:?}", expr);
+                            expr
+                        }
+                        Err(e) => {
+                            error!("Parser", "Failed to parse function argument: {}", e);
+                            return Err(e);
+                        }
+                    };
+                    args.push(arg);
+
+                    if !self.match_token(TokenType::Comma) {
+                        trace!("Parser", "No more function arguments");
+                        self.advance();
+                        break;
+                    }
+                    trace!("Parser", "Found comma, expecting another argument");
+                }
+                debug!("Parser", "Function called with {} arguments", args.len());
+
+                return Ok(Expr::Call {
+                    callee: name.to_string(),
+                    arguments: args,
+                });
+            } else {
+                return Err(String::from("Expected left paren"));
+            }
+        }
+        Ok(expr)
+    }
+
     fn equality(&mut self) -> Result<Expr, String> {
         trace!("Parser", "Parsing equality expression");
         let mut expr = match self.comparison() {
@@ -2110,7 +2311,7 @@ impl Parser {
 
     fn expression(&mut self) -> Result<Expr, String> {
         trace!("Parser", "Parsing expression");
-        self.equality()
+        self.function_call()
     }
 
     fn term(&mut self) -> Result<Expr, String> {
@@ -2400,61 +2601,158 @@ impl Parser {
     }
 }
 
- File path: ./src/tokens.rs 
+ File path: ./src/log.rs 
  
-use crate::ast_node::Expr;
-pub struct FunctionCallData {
-    args: Vec<Expr>,
-}
-#[derive(Debug, PartialEq, Clone)]
-pub enum TokenType {
-    // Literals
-    Number(f64),
-    Identifier(String),
-    Bool(bool),
-    String(String),
+use std::fmt::Display;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // Operators
-    Plus,
-    Minus,
-    Star,
-    Slash,
+// ANSI color codes
+pub const RED: &str = "\x1b[31m";
+pub const YELLOW: &str = "\x1b[33m";
+pub const GREEN: &str = "\x1b[32m";
+pub const BLUE: &str = "\x1b[34m";
+pub const MAGENTA: &str = "\x1b[35m";
+pub const CYAN: &str = "\x1b[36m";
+pub const RESET: &str = "\x1b[0m";
+pub const BOLD: &str = "\x1b[1m";
 
-    //comaprison
-    Equal,
-    BangEqual,
-    EqualEqual,
-    Greater,
-    Less,
-    GreaterOrEq,
-    LessOrEq,
-
-    //logical ops
-    LogicalNot,
-
-    // Delimiters
-    LeftParen,
-    RightParen,
-    LeftBrace,
-    RightBrace,
-    DoubleQuotes,
-
-    FunctionDeclaration,
-    FunctionCall,
-    Comma,
-
-    Let,
-    If,
-    Else,
-    Echo,
-    // Control
-    EOF,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel {
+    Off,
+    Error,
+    Warning,
+    Info,
+    Debug,
+    Trace,
 }
 
-#[derive(Debug, Clone)]
-pub struct Token {
-    pub token_type: TokenType,
-    pub line: usize,
-    pub column: usize,
+static CURRENT_LOG_LEVEL: AtomicUsize = AtomicUsize::new(LogLevel::Info as usize);
+
+pub fn set_log_level(level: LogLevel) {
+    CURRENT_LOG_LEVEL.store(level as usize, Ordering::SeqCst);
 }
 
+pub fn get_log_level() -> LogLevel {
+    match CURRENT_LOG_LEVEL.load(Ordering::SeqCst) {
+        0 => LogLevel::Off,
+        1 => LogLevel::Error,
+        2 => LogLevel::Warning,
+        3 => LogLevel::Info,
+        4 => LogLevel::Debug,
+        _ => LogLevel::Trace,
+    }
+}
+
+pub fn is_enabled(level: LogLevel) -> bool {
+    level as usize <= CURRENT_LOG_LEVEL.load(Ordering::SeqCst)
+}
+
+fn log_message(level: LogLevel, component: &str, message: &str) {
+    if !is_enabled(level) {
+        return;
+    }
+
+    let (level_name, color) = match level {
+        LogLevel::Off => unreachable!(),
+        LogLevel::Error => ("ERROR", RED),
+        LogLevel::Warning => ("WARN ", YELLOW),
+        LogLevel::Info => ("INFO ", GREEN),
+        LogLevel::Debug => ("DEBUG", BLUE),
+        LogLevel::Trace => ("TRACE", MAGENTA),
+    };
+
+    eprintln!(
+        "{}{}[{}]{} {}{}[{}]{} {}",
+        color, BOLD, level_name, RESET, CYAN, BOLD, component, RESET, message
+    );
+}
+
+pub fn error(component: &str, message: impl Display) {
+    log_message(LogLevel::Error, component, &format!("{message}"));
+}
+
+pub fn warn(component: &str, message: impl Display) {
+    log_message(LogLevel::Warning, component, &format!("{message}"));
+}
+
+pub fn info(component: &str, message: impl Display) {
+    log_message(LogLevel::Info, component, &format!("{message}"));
+}
+
+pub fn debug(component: &str, message: impl Display) {
+    log_message(LogLevel::Debug, component, &format!("{message}"));
+}
+
+pub fn trace(component: &str, message: impl Display) {
+    log_message(LogLevel::Trace, component, &format!("{message}"));
+}
+
+#[macro_export]
+macro_rules! log_if {
+    ($level:expr, $component:expr, $($arg:tt)*) => {
+        if $crate::log::is_enabled($level) {
+            let message = format!($($arg)*);
+            match $level {
+                $crate::log::LogLevel::Error => $crate::log::error($component, message),
+                $crate::log::LogLevel::Warning => $crate::log::warn($component, message),
+                $crate::log::LogLevel::Info => $crate::log::info($component, message),
+                $crate::log::LogLevel::Debug => $crate::log::debug($component, message),
+                $crate::log::LogLevel::Trace => $crate::log::trace($component, message),
+                _ => {},
+            }
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! error {
+    ($component:expr, $($arg:tt)*) => {
+        $crate::log_if!($crate::log::LogLevel::Error, $component, $($arg)*)
+    };
+}
+
+#[macro_export]
+macro_rules! warn {
+    ($component:expr, $($arg:tt)*) => {
+        $crate::log_if!($crate::log::LogLevel::Warning, $component, $($arg)*)
+    };
+}
+
+#[macro_export]
+macro_rules! info {
+    ($component:expr, $($arg:tt)*) => {
+        $crate::log_if!($crate::log::LogLevel::Info, $component, $($arg)*)
+    };
+}
+
+#[macro_export]
+macro_rules! debug {
+    ($component:expr, $($arg:tt)*) => {
+        $crate::log_if!($crate::log::LogLevel::Debug, $component, $($arg)*)
+    };
+}
+
+#[macro_export]
+macro_rules! trace {
+    ($component:expr, $($arg:tt)*) => {
+        $crate::log_if!($crate::log::LogLevel::Trace, $component, $($arg)*)
+    };
+}
+
+ File path: ./Cargo.toml 
+ 
+[package]
+name = "compiler"
+version = "0.1.0"
+edition = "2021"
+
+
+ File path: ./Cargo.lock 
+ 
+# This file is automatically @generated by Cargo.
+# It is not intended for manual editing.
+version = 4
+
+[[package]]
+name = "compiler"
+version = "0.1.0"

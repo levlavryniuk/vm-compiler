@@ -36,7 +36,6 @@ pub enum TokenType {
     DoubleQuotes,
 
     FunctionDeclaration,
-    FunctionCall,
     Comma,
 
     Let,
@@ -44,6 +43,7 @@ pub enum TokenType {
     Else,
     Echo,
     // Control
+    Return,
     EOF,
 }
 

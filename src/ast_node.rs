@@ -22,6 +22,10 @@ pub enum Expr {
     Variable {
         name: Token,
     },
+    Call {
+        callee: String,
+        arguments: Vec<Expr>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -54,15 +58,6 @@ impl PartialEq for LiteralValue {
             _ => false,
         }
     }
-    fn ne(&self, other: &Self) -> bool {
-        match (self, other) {
-            (LiteralValue::Number(num1), LiteralValue::Number(num2)) => num1 != num2,
-            (LiteralValue::String(str1), LiteralValue::String(str2)) => str1 != str2,
-            (LiteralValue::Bool(bool1), LiteralValue::Bool(bool2)) => bool1 != bool2,
-            (LiteralValue::Nil, LiteralValue::Nil) => false,
-            _ => true,
-        }
-    }
 }
 
 impl Display for LiteralValue {
@@ -92,10 +87,15 @@ pub enum Stmt {
     Block {
         statements: Vec<Stmt>,
     },
+
+    Return {
+        value: Option<Expr>,
+    },
     FunctionDeclaration {
         args: Vec<Expr>,
         name: String,
         body: Box<Stmt>,
+        returns_value: bool,
     },
     Let {
         name: Token,

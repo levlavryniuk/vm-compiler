@@ -1,6 +1,6 @@
 use crate::ast_node::*;
 use crate::tokens::*;
-use crate::{debug, error, info, trace, warn};
+use crate::{debug, error, info, trace};
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -66,6 +66,11 @@ impl Parser {
                 debug!("Parser", "Parsing echo statement at line {}", token.line);
                 self.advance();
                 self.echo_statement()
+            }
+            TokenType::Return => {
+                debug!("Parser", "Parsing return statement at line {}", token.line);
+                self.advance();
+                self.return_statement()
             }
             TokenType::FunctionDeclaration => {
                 debug!(
@@ -151,15 +156,29 @@ impl Parser {
                     }
                 };
 
+                let returns_value = if let Stmt::Block { statements } = &function_body {
+                    statements.last().map_or(false, |s| {
+                        if let Stmt::Return { value } = s {
+                            value.is_some()
+                        } else {
+                            false
+                        }
+                    })
+                } else {
+                    false
+                };
+
                 debug!(
                     "Parser",
-                    "Successfully parsed function declaration '{}'", function_name
+                    "Successfully parsed function declaration without return value '{}'",
+                    function_name
                 );
-                return Ok(Stmt::FunctionDeclaration {
+                Ok(Stmt::FunctionDeclaration {
                     args,
                     name: function_name,
                     body: Box::new(function_body),
-                });
+                    returns_value,
+                })
             } else {
                 error!("Parser", "Expected {{, found {:?}", self.peek());
                 Err(String::from("Expected function body"))
@@ -168,6 +187,25 @@ impl Parser {
             error!("Parser", "Expected (, found {:?}", self.peek());
             Err(String::from("Expected left paren"))
         }
+    }
+
+    fn return_statement(&mut self) -> Result<Stmt, String> {
+        trace!("Parser", "Looking for return expression");
+        if self.peek().token_type == TokenType::RightBrace {
+            debug!("Parser", "No return expression found");
+            return Ok(Stmt::Return { value: None });
+        }
+        let expr = match self.expression() {
+            Ok(e) => e,
+            Err(e) => {
+                error!("Parser", "Failed to parse return expression: {}", e);
+                return Err(e);
+            }
+        };
+
+        debug!("Parser", "Successfully parsed return expression");
+
+        Ok(Stmt::Return { value: Some(expr) })
     }
 
     fn let_statement(&mut self) -> Result<Stmt, String> {
@@ -350,6 +388,54 @@ impl Parser {
         }
     }
 
+    fn function_call(&mut self) -> Result<Expr, String> {
+        let expr = self.equality()?;
+
+        if let Expr::Variable {
+            name:
+                Token {
+                    token_type: TokenType::Identifier(name),
+                    ..
+                },
+        } = &expr
+        {
+            if self.check(|t| *t == TokenType::LeftParen) {
+                self.advance(); // Consume the left paren
+                debug!("Parser", "Parsing function call arguments");
+                let mut args = Vec::new();
+
+                while !self.match_token(TokenType::RightParen) {
+                    trace!("Parser", "Parsing function call argument");
+                    let arg = match self.expression() {
+                        Ok(expr) => {
+                            debug!("Parser", "Added function argument: {:?}", expr);
+                            expr
+                        }
+                        Err(e) => {
+                            error!("Parser", "Failed to parse function argument: {}", e);
+                            return Err(e);
+                        }
+                    };
+                    args.push(arg);
+
+                    if !self.match_token(TokenType::Comma) {
+                        trace!("Parser", "No more function arguments");
+                        self.advance();
+                        break;
+                    }
+                    trace!("Parser", "Found comma, expecting another argument");
+                }
+                debug!("Parser", "Function called with {} arguments", args.len());
+
+                return Ok(Expr::Call {
+                    callee: name.to_string(),
+                    arguments: args,
+                });
+            }
+        }
+        Ok(expr)
+    }
+
     fn equality(&mut self) -> Result<Expr, String> {
         trace!("Parser", "Parsing equality expression");
         let mut expr = match self.comparison() {
@@ -453,7 +539,7 @@ impl Parser {
 
     fn expression(&mut self) -> Result<Expr, String> {
         trace!("Parser", "Parsing expression");
-        self.equality()
+        self.function_call()
     }
 
     fn term(&mut self) -> Result<Expr, String> {

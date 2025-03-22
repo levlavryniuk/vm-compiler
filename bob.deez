@@ -1,4 +1,7 @@
-fn cock_n_balls(a,b){
-  echo a
-  echo b
+fn bob(counter) {
+  return
 }
+
+
+
+bob(10)

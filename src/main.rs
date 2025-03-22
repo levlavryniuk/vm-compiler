@@ -4,7 +4,7 @@ use ir::IrGenerator;
 use lexer::Lexer;
 use log::set_log_level;
 use parser::Parser;
-use semantic::{Context, TypeChecker};
+//use semantic::{Context, TypeChecker};
 use std::{fs::File, io::Read};
 use vm::VM;
 
@@ -15,7 +15,7 @@ mod codegen;
 mod ir;
 mod lexer;
 mod parser;
-mod semantic;
+//mod semantic;
 mod tokens;
 mod vm;
 //
@@ -34,23 +34,35 @@ fn main() {
     let mut parser = Parser::new(tokens);
     let stmts = parser.parse().expect("Parser sais:");
 
-    let mut semantic_checker = TypeChecker::new();
+    //let mut semantic_checker = TypeChecker::new();
 
-    let mut ctx = Context::new();
-    semantic_checker
-        .check(&mut ctx, &stmts)
-        .expect("Type checker said:");
+    //let mut ctx = Context::new();
+    //semantic_checker
+    //    .check(&mut ctx, &stmts)
+    //    .expect("Type checker said:");
 
     let mut ir = IrGenerator::new();
 
     let ir_program = ir.generate(&stmts);
 
+    // ir_program
+    //     .instructions
+    //     .iter()
+    //     .enumerate()
+    //     .for_each(|(i, v)| {
+    //         println!("\nInstruction {}", i);
+    //         dbg!(v);
+    //     });
+    // dbg!(&ir_program.functions);
     let mut codegen = BytecodeGenerator::new();
 
     let bytecode = codegen.generate(&ir_program);
 
+    // bytecode.instructions.iter().enumerate().for_each(|(i, v)| {
+    //     println!("\nInstruction {}", i);
+    //     dbg!(v);
+    // });
     let mut vm = VM::new(&bytecode);
 
-    let _ = vm.execute(&bytecode);
-    ()
+    // let _ = vm.execute(&bytecode);
 }

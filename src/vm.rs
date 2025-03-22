@@ -7,26 +7,18 @@ pub struct VM {
     variables: Vec<LiteralValue>,
     stack: Vec<LiteralValue>,
     ip: usize,
-    sp: usize,
     fp: usize,
 }
 
-pub struct StackFrame {
-    return_addr: usize,
-    previus_frame_ptr: usize,
-    sp: usize,
-    fp: usize,
-}
 impl VM {
     pub fn new(bytecode: &Bytecode) -> Self {
         info!("VM", "Creating new VM instance");
         VM {
             constants: bytecode.constants.clone(),
-            variables: vec![LiteralValue::Number(0.); bytecode.variables.len()],
+            variables: vec![LiteralValue::Number(0.); 256],
             stack: Vec::with_capacity(256),
             ip: 0,
             fp: 0,
-            sp: 0,
         }
     }
 
@@ -42,11 +34,15 @@ impl VM {
         }
     }
 
+    fn log_stack(&self) {
+        trace!("VM", "Current stack: {:?}", &self.stack);
+    }
+
     pub fn execute(&mut self, bytecode: &Bytecode) -> Result<LiteralValue, String> {
         info!("VM", "Starting bytecode execution");
 
         while self.ip < bytecode.instructions.len() {
-            trace!("VM", "Stack: {:?}", &self.stack);
+            self.log_stack(); // Log the current stack
             trace!(
                 "VM",
                 "IP: {}, Instruction: {}",
@@ -61,6 +57,102 @@ impl VM {
                     let idx = operand.unwrap();
                     debug!("VM", "Loading constant[{}]: {:?}", idx, self.constants[idx]);
                     self.stack.push(self.constants[idx].clone());
+                }
+
+                BytecodeOp::Call => {
+                    let function_addr = operand.unwrap();
+                    debug!("VM", "Calling function at address {}", function_addr);
+
+                    // Save return address (next instruction after this call)
+                    let return_addr = self.ip + 1;
+                    self.stack.push(LiteralValue::Number(return_addr as f64));
+                    debug!("VM", "Saved return address: {}", return_addr);
+
+                    // Save current frame pointer
+                    self.stack.push(LiteralValue::Number(self.fp as f64));
+                    debug!("VM", "Saved frame pointer: {}", self.fp);
+
+                    // Set new frame pointer to current stack position
+                    self.fp = self.stack.len() - 1;
+                    debug!("VM", "New frame pointer set to: {}", self.fp);
+
+                    // Jump to function start
+                    self.ip = function_addr;
+                    continue; // Skip normal ip increment
+                }
+
+                BytecodeOp::Push => {
+                    // Used for pushing function arguments
+                    if let Some(reg_idx) = operand {
+                        debug!("VM", "Pushing variable[{}] to stack", reg_idx);
+                        self.stack.push(self.variables[reg_idx].clone());
+                    }
+                }
+
+                BytecodeOp::LoadParam => {
+                    // Used to access function parameters from within function body
+                    if let Some(param_idx) = operand {
+                        // Parameters are below the frame in reverse order
+                        // fp points to saved old FP, fp-1 points to return address
+                        // First parameter is at fp-2, second at fp-3, etc.
+                        let stack_idx = self.fp - 2 - param_idx;
+
+                        if stack_idx < self.stack.len() {
+                            debug!(
+                                "VM",
+                                "Loading parameter {} from stack position {}", param_idx, stack_idx
+                            );
+                            let param_value = self.stack[stack_idx].clone();
+                            self.stack.push(param_value);
+                        } else {
+                            error!("VM", "Parameter index out of bounds: {}", param_idx);
+                            return Err(format!("Parameter index out of bounds: {}", param_idx));
+                        }
+                    }
+                }
+
+                BytecodeOp::Return => {
+                    // Save return value (if any)
+                    self.log_stack(); // Log stack before return
+                    let return_value = if self.stack.len() > 2 {
+                        debug!("VM", "Returning value from stack");
+                        self.stack.pop().unwrap()
+                    } else {
+                        debug!("VM", "No return value on stack");
+                        LiteralValue::Number(0.0)
+                    };
+
+                    debug!("VM", "Stack after getting return value: {:?}", &self.stack);
+                    debug!("VM", "Function returning with value: {:?}", return_value);
+
+                    // Restore stack to previous frame
+                    self.log_stack(); // Log stack before restoring frame
+
+                    // Pop and restore old frame pointer
+                    if let Some(LiteralValue::Number(old_fp)) = self.stack.pop() {
+                        self.fp = old_fp as usize;
+                        debug!("VM", "Restored frame pointer to: {}", self.fp);
+                    }
+
+                    debug!(
+                        "VM",
+                        "Stack after restoring frame pointer: {:?}", &self.stack
+                    );
+
+                    // Pop and jump to return address
+                    if let Some(LiteralValue::Number(return_addr)) = self.stack.pop() {
+                        self.ip = return_addr as usize;
+                        debug!("VM", "Jumping to return address: {}", self.ip);
+
+                        // Push return value back on stack
+                        self.stack.push(return_value);
+                        debug!("VM", "Pushed return value onto stack");
+                        self.log_stack(); // Log stack after return
+                        continue; // Skip normal ip increment
+                    } else {
+                        error!("VM", "Missing return address on stack");
+                        return Err("Invalid return address on stack".to_string());
+                    }
                 }
                 BytecodeOp::Echo => {
                     let value = self.stack.pop().unwrap();
@@ -157,19 +249,6 @@ impl VM {
                     } else {
                         error!("VM", "Type error: Cannot negate non-numeric value");
                     }
-                }
-                BytecodeOp::Return => {
-                    let result = if self.stack.is_empty() {
-                        debug!("VM", "Return with empty stack, defaulting to 0");
-                        LiteralValue::Number(0.)
-                    } else {
-                        let value = self.stack.pop().unwrap();
-                        debug!("VM", "Return value: {:?}", value);
-                        value
-                    };
-
-                    info!("VM", "Execution completed with result: {:?}", result);
-                    return Ok(result);
                 }
                 BytecodeOp::Jump => {
                     let target = operand.unwrap();

@@ -182,13 +182,11 @@ impl Lexer {
 
         debug!("Lexer", "String literal: \"{}\"", contents);
 
-        let token = Token {
+        Token {
             column: start_column,
             line: start_line,
             token_type: TokenType::String(contents),
-        };
-
-        token
+        }
     }
 
     fn number(&mut self) -> Token {
@@ -201,17 +199,17 @@ impl Lexer {
         let start_column = self.column;
 
         // loop until number is ended. start_pos -> self.position is the "number"
-        while !self.is_at_end() && self.peek().is_digit(10) {
+        while !self.is_at_end() && self.peek().is_ascii_digit() {
             self.advance();
         }
 
         // if prev loop stopped because of non-digit - it is probably a decimal ".",  so skip it
         // and go back to number proccessing
-        if !self.is_at_end() && self.peek() == '.' && self.peek_next().is_digit(10) {
+        if !self.is_at_end() && self.peek() == '.' && self.peek_next().is_ascii_digit() {
             trace!("Lexer", "Found decimal point in number");
             self.advance(); // Consume the '.'
 
-            while !self.is_at_end() && self.peek().is_digit(10) {
+            while !self.is_at_end() && self.peek().is_ascii_digit() {
                 self.advance();
             }
         }
@@ -261,6 +259,7 @@ impl Lexer {
             "false" => TokenType::Bool(false),
             "echo" => TokenType::Echo,
             "fn" => TokenType::FunctionDeclaration,
+            "return" => TokenType::Return,
             _ => TokenType::Identifier(identifier),
         };
 
