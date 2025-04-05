@@ -15,12 +15,13 @@ mod codegen;
 mod ir;
 mod lexer;
 mod parser;
+mod symbol_table;
 //mod semantic;
 mod tokens;
 mod vm;
 //
 fn main() {
-    set_log_level(LogLevel::Debug);
+    set_log_level(LogLevel::Trace);
     let mut file = File::open("bob.deez").unwrap();
 
     let mut buf = String::new();
@@ -45,6 +46,9 @@ fn main() {
 
     let ir_program = ir.generate(&stmts);
 
+    ir.log_instructions();
+
+    dbg!(&ir_program.instructions.len());
     // ir_program
     //     .instructions
     //     .iter()
@@ -57,6 +61,7 @@ fn main() {
     let mut codegen = BytecodeGenerator::new();
 
     let bytecode = codegen.generate(&ir_program);
+    dbg!(&bytecode.instructions.len());
 
     // bytecode.instructions.iter().enumerate().for_each(|(i, v)| {
     //     println!("\nInstruction {}", i);
@@ -64,5 +69,5 @@ fn main() {
     // });
     let mut vm = VM::new(&bytecode);
 
-    // let _ = vm.execute(&bytecode);
+    vm.execute(&bytecode).unwrap();
 }

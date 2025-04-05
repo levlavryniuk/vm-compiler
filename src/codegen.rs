@@ -2,7 +2,7 @@ use std::{collections::HashMap, ops::Deref};
 
 use crate::{
     ast_node::LiteralValue,
-    debug, error, info,
+    error, info,
     ir::{Instruction, IrProgram, OpCode, Operand},
     trace,
 };
@@ -12,6 +12,7 @@ pub enum BytecodeOp {
     LoadConst,
     LoadVar,
     StoreVar,
+    EnterStackFrame,
     Add,
     Subtract,
     Multiply,
@@ -19,6 +20,7 @@ pub enum BytecodeOp {
     Negate,
     Echo,
     Equals,
+    Label,
     NotEquals,
     Return,
 
@@ -26,7 +28,6 @@ pub enum BytecodeOp {
     Less,
     GreaterOrEq,
     Call,      // New: Call a function
-    Push,      // New: Push value to stack
     LoadParam, // New: Load parameter from stack
     LessOrEq,
     JumpIfFalse,
@@ -40,12 +41,14 @@ pub struct Bytecode {
     pub functions: HashMap<String, (usize, usize, bool)>,
     // name -> (start_address, param_count, does_return?)
     pub instructions: Vec<(BytecodeOp, Option<usize>)>,
+    pub labels: HashMap<String, usize>,
 }
 
 pub struct BytecodeGenerator {
     constants: Vec<LiteralValue>,
     pub functions: HashMap<String, (usize, usize, bool)>, // name -> (start_address, param_count)
     variables: Vec<String>,
+    labels: HashMap<String, usize>,
     instructions: Vec<(BytecodeOp, Option<usize>)>,
 }
 
@@ -54,6 +57,7 @@ impl BytecodeGenerator {
         info!("Bytecode", "Creating new Bytecode generator");
         BytecodeGenerator {
             constants: Vec::new(),
+            labels: HashMap::new(),
             variables: Vec::new(),
             instructions: Vec::new(),
             functions: HashMap::new(),
@@ -66,22 +70,56 @@ impl BytecodeGenerator {
             "Starting Bytecode generation for {} instructions",
             ir.instructions.len()
         );
+
+        trace!("Bytecode", "-------------- START --------------");
+        let mut codegen_index = 0;
+
+        for instruction in &ir.instructions {
+            if instruction.op == OpCode::Label {
+                if let Operand::Label(label) = &instruction.operands[0] {
+                    self.labels.insert(label.clone(), codegen_index);
+                }
+            } else {
+                let instruction_size = self.instruction_size(instruction);
+                trace!(
+                    "Bytecode",
+                    "Instruction {:?} size is {}",
+                    instruction.op,
+                    instruction_size
+                );
+                codegen_index += instruction_size;
+                trace!(
+                    "Bytecode",
+                    "Codegen index updated to {} after instruction {:?}",
+                    codegen_index,
+                    instruction.op
+                );
+            }
+        }
+
+        trace!("Bytecode", "-------------- END --------------");
+        self.instructions.clear();
         for instruction in &ir.instructions {
             trace!(
                 "Bytecode",
                 "Generating Bytecode for instruction: {:?}",
                 instruction
             );
+            dbg!(&self.variables);
             self.generate_instruction(instruction);
         }
+
+        self.log_instructions();
 
         info!(
             "Bytecode",
             "Bytecode generation complete, produced {} instructions",
             self.instructions.len()
         );
+
         Bytecode {
             constants: self.constants.clone(),
+            labels: self.labels.clone(),
             variables: self.variables.clone(),
             functions: self.functions.clone(),
             instructions: self.instructions.clone(),
@@ -90,6 +128,11 @@ impl BytecodeGenerator {
 
     fn generate_instruction(&mut self, instruction: &Instruction) {
         match instruction.op {
+            OpCode::Label => {
+                if let Operand::Label(label) = &instruction.operands[0] {
+                    self.labels.insert(label.clone(), self.instructions.len());
+                }
+            }
             OpCode::LoadConst => {
                 if let Operand::Immediate(value) = &instruction.operands[1] {
                     let const_idx = self.add_constant(value.clone());
@@ -107,7 +150,6 @@ impl BytecodeGenerator {
                     &instruction.operands[1],
                     &instruction.operands[2],
                 ) {
-                    // Record the current position as the start of this function
                     let function_start = self.instructions.len();
                     self.functions.insert(
                         name.clone(),
@@ -124,12 +166,9 @@ impl BytecodeGenerator {
             }
 
             OpCode::Call => {
-                if let [Operand::Register(result_reg), Operand::Immediate(LiteralValue::String(name)), Operand::Immediate(LiteralValue::Number(_))] =
-                    instruction.operands.as_slice()
-                {
-                    if let Some((function_addr, .., returns_value)) = self.functions.get(name) {
+                if let Operand::Immediate(LiteralValue::String(name)) = &instruction.operands[1] {
+                    if let Some(function_addr) = self.labels.get(name) {
                         let function_addr = *function_addr;
-                        let returns_value = *returns_value;
 
                         self.emit(BytecodeOp::Call, Some(function_addr));
                         // if returns_value {
@@ -166,18 +205,12 @@ impl BytecodeGenerator {
             }
 
             OpCode::LoadParam => {
-                if let Operand::Immediate(LiteralValue::Number(idx)) = &instruction.operands[1] {
+                if let Operand::Immediate(LiteralValue::Number(idx)) = &instruction.operands[0] {
                     self.emit(BytecodeOp::LoadParam, Some(*idx as usize));
                     trace!("Bytecode", "Loaded parameter at index {}", idx);
                 }
             }
 
-            OpCode::Push => {
-                if let Operand::Register(reg) = instruction.operands[0] {
-                    self.emit(BytecodeOp::Push, Some(reg));
-                    trace!("Bytecode", "Pushed value from register {} to stack", reg);
-                }
-            }
             OpCode::DeclareVar => {
                 if let Operand::Immediate(LiteralValue::String(s)) = &instruction.operands[0] {
                     let var_idx = self.add_variable(s);
@@ -220,7 +253,7 @@ impl BytecodeGenerator {
             }
 
             OpCode::LoadVar => {
-                if let Operand::Variable(ref name) = instruction.operands[1] {
+                if let Operand::Variable(ref name) = instruction.operands[0] {
                     let var_idx = self.add_variable(name);
                     self.emit(BytecodeOp::LoadVar, Some(var_idx));
                     trace!(
@@ -229,6 +262,8 @@ impl BytecodeGenerator {
                         name,
                         var_idx
                     );
+                } else {
+                    error!("Bytecode", "No variable name provided");
                 }
             }
             OpCode::StoreVar => {
@@ -244,27 +279,29 @@ impl BytecodeGenerator {
                 }
             }
             OpCode::Jump => {
-                if let Operand::Immediate(LiteralValue::Number(target_addr)) =
-                    instruction.operands[0]
-                {
-                    self.emit(BytecodeOp::Jump, Some(target_addr as usize));
+                if let Operand::Label(label) = &instruction.operands[0] {
+                    let target_addr = self.labels.get(label).unwrap();
                     trace!(
                         "Bytecode",
-                        "Generated Jump instruction to address {}",
+                        "Generated Jump instruction to address {}->{}",
+                        label,
                         target_addr
                     );
+                    self.emit(BytecodeOp::Jump, Some(*target_addr));
+                } else {
+                    error!("Bytecode", "No label provided");
                 }
             }
             OpCode::JumpIfFalse => {
-                if let Operand::Immediate(LiteralValue::Number(target_addr)) =
-                    instruction.operands[1]
-                {
-                    self.emit(BytecodeOp::JumpIfFalse, Some(target_addr as usize));
+                if let Operand::Label(label) = &instruction.operands[1] {
+                    let target_addr = self.labels.get(label).unwrap();
                     trace!(
                         "Bytecode",
-                        "Generated JumpIfFalse instruction to address {}",
+                        "Generated JumpIfFalse instruction to address {}->{}",
+                        label,
                         target_addr
                     );
+                    self.emit(BytecodeOp::JumpIfFalse, Some(*target_addr));
                 }
             }
             OpCode::Add => {
@@ -287,7 +324,6 @@ impl BytecodeGenerator {
                 self.emit(BytecodeOp::Negate, None);
                 trace!("Bytecode", "Generated Negate instruction");
             }
-            _ => (),
         }
     }
 
@@ -321,5 +357,24 @@ impl BytecodeGenerator {
             op,
             operand
         );
+    }
+
+    pub fn log_instructions(&self) {
+        println!("--- Generated CODEGEN Instructions ---");
+        for (index, instruction) in self.instructions.iter().enumerate() {
+            print!("{:04}: {:?} ", index, instruction.0);
+            print!("{:?}", instruction.1);
+            println!();
+        }
+        println!("--- End of CODEGEN Instructions ---");
+    }
+
+    fn instruction_size(&self, instruction: &Instruction) -> usize {
+        match instruction.op {
+            OpCode::Label => 0,
+            OpCode::FunctionDeclaration => 0,
+            OpCode::Jump => 1,
+            _ => 1,
+        }
     }
 }

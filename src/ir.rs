@@ -1,4 +1,5 @@
 use crate::ast_node::*;
+use crate::symbol_table::{Symbol, SymbolKind, SymbolTable};
 use crate::tokens::*;
 use crate::{debug, error, info, trace};
 use std::collections::HashMap;
@@ -29,8 +30,8 @@ pub enum OpCode {
     Echo,
 
     Call,      // New: Call a function
-    Push,      // New: Push value to stack
     LoadParam, // New: Load parameter from stack
+    Label,
     Jump,
     JumpIfFalse,
 }
@@ -44,6 +45,7 @@ pub struct Instruction {
 #[derive(Debug, Clone)]
 pub enum Operand {
     Register(usize),
+    Label(String),
     Immediate(LiteralValue),
     Variable(String),
 }
@@ -57,6 +59,8 @@ pub struct IrProgram {
 pub struct IrGenerator {
     instructions: Vec<Instruction>,
     pub functions: HashMap<String, (usize, usize, bool)>, // name -> (start_address, param_count)
+    symbol_table: SymbolTable,
+    label_counter: usize,
     temp_counter: usize,
 }
 
@@ -66,7 +70,9 @@ impl IrGenerator {
         IrGenerator {
             instructions: Vec::new(),
             temp_counter: 0,
+            label_counter: 0,
             functions: HashMap::new(),
+            symbol_table: SymbolTable::new(),
         }
     }
 
@@ -87,6 +93,7 @@ impl IrGenerator {
             self.instructions.len(),
             self.functions.len()
         );
+        dbg!(&self.symbol_table);
         IrProgram {
             instructions: self.instructions.clone(),
             functions: self.functions.clone(),
@@ -120,6 +127,7 @@ impl IrGenerator {
                 returns_value,
             } => {
                 debug!("IR", "Generating IR for function declaration '{}'", name);
+                self.symbol_table.enter_scope();
                 let function_start = self.instructions.len();
                 trace!(
                     "IR",
@@ -129,12 +137,10 @@ impl IrGenerator {
                 );
 
                 // Add jump over the function body
-                self.emit(
-                    OpCode::Jump,
-                    vec![Operand::Immediate(LiteralValue::Number(0.))],
-                );
+                self.emit(OpCode::Jump, vec![Operand::Label(name.clone() + "_end")]);
                 trace!("IR", "Added jump placeholder at start of function");
 
+                self.emit(OpCode::Label, vec![Operand::Label(name.clone())]);
                 // Function declaration
                 self.emit(
                     OpCode::FunctionDeclaration,
@@ -152,16 +158,35 @@ impl IrGenerator {
                     returns_value
                 );
 
-                // Generate function body
+                for (i, arg) in args.iter().enumerate() {
+                    if let Expr::Variable { name: token } = arg {
+                        if let TokenType::Identifier(name_str) = &token.token_type {
+                            self.symbol_table.insert(
+                                name_str,
+                                Symbol {
+                                    kind: SymbolKind::Param,
+                                },
+                            );
+                            self.emit(
+                                OpCode::LoadParam,
+                                vec![
+                                    Operand::Immediate(LiteralValue::Number(i as f64)),
+                                    Operand::Variable(name_str.clone()),
+                                ],
+                            );
+                        }
+                    }
+                }
+
                 trace!("IR", "Generating IR for function body");
                 self.generate_statement(body);
                 debug!("IR", "Successfully generated function body");
+                self.symbol_table.exit_scope();
 
-                // Add implicit return if needed
                 self.emit(OpCode::Return, vec![]);
                 trace!("IR", "Added implicit return at end of function");
 
-                let function_end = self.instructions.len();
+                let function_end = self.instructions.len() - 1;
                 trace!(
                     "IR",
                     "Function '{}' ends at instruction index {}",
@@ -169,18 +194,7 @@ impl IrGenerator {
                     function_end
                 );
 
-                // Fix up the jump at the start of the function
-                if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
-                    self.instructions[function_start].operands[0]
-                {
-                    *value = function_end as f64 - 1.0;
-                    trace!(
-                        "IR",
-                        "Updated jump at start of function to {} (end of function)",
-                        function_end - 1
-                    );
-                }
-
+                self.emit(OpCode::Label, vec![Operand::Label(name.clone() + "_end")]);
                 // Register the function
                 self.functions
                     .insert(name.clone(), (function_start, args.len(), *returns_value));
@@ -209,6 +223,12 @@ impl IrGenerator {
                     debug!("IR", "Initializer result in register {}", temp);
 
                     if let TokenType::Identifier(name_str) = &name.token_type {
+                        self.symbol_table.insert(
+                            name_str,
+                            Symbol {
+                                kind: SymbolKind::Variable,
+                            },
+                        );
                         self.emit(
                             OpCode::StoreVar,
                             vec![Operand::Variable(name_str.clone()), Operand::Register(temp)],
@@ -237,13 +257,16 @@ impl IrGenerator {
                 debug!("IR", "If condition result in register {}", condition_temp);
 
                 let jump_if_false_idx = self.instructions.len();
+                let jump_if_false_label =
+                    format!("if_false_{}_{}", jump_if_false_idx, self.label_counter);
+                self.label_counter += 1;
                 trace!("IR", "Adding JumpIfFalse at index {}", jump_if_false_idx);
 
                 self.emit(
                     OpCode::JumpIfFalse,
                     vec![
                         Operand::Register(condition_temp),
-                        Operand::Immediate(LiteralValue::Number(0.)),
+                        Operand::Label(jump_if_false_label.clone()),
                     ],
                 );
 
@@ -260,44 +283,24 @@ impl IrGenerator {
                         jump_end_idx
                     );
 
-                    self.emit(
-                        OpCode::Jump,
-                        vec![Operand::Immediate(LiteralValue::Number(0.0))],
-                    );
+                    let jump_end_label = format!("if_end_{}_{}", jump_end_idx, self.label_counter);
+                    self.label_counter += 1;
+                    self.emit(OpCode::Jump, vec![Operand::Label(jump_end_label.clone())]);
 
                     let else_start_idx = self.instructions.len();
                     trace!("IR", "Else branch starts at index {}", else_start_idx);
 
-                    // Update the jump if false to jump to else
-                    if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
-                        self.instructions[jump_if_false_idx].operands[1]
-                    {
-                        *value = else_start_idx as f64;
-                        trace!(
-                            "IR",
-                            "Updated JumpIfFalse to jump to else branch at {}",
-                            else_start_idx
-                        );
-                    }
-
                     trace!("IR", "Generating IR for else branch");
+                    self.emit(
+                        OpCode::Label,
+                        vec![Operand::Label(jump_if_false_label.clone())],
+                    );
                     self.generate_statement(else_branch);
                     debug!("IR", "Successfully generated IR for else branch");
 
                     let end_idx = self.instructions.len();
                     trace!("IR", "If-else statement ends at index {}", end_idx);
-
-                    // Update the jump at the end of the then branch
-                    if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
-                        self.instructions[jump_end_idx].operands[0]
-                    {
-                        *value = end_idx as f64 - 1.0;
-                        trace!(
-                            "IR",
-                            "Updated jump at end of then branch to {}",
-                            end_idx - 1
-                        );
-                    }
+                    self.emit(OpCode::Label, vec![Operand::Label(jump_end_label.clone())]);
 
                     debug!("IR", "Successfully generated complete if-else statement");
                 } else {
@@ -305,17 +308,10 @@ impl IrGenerator {
                     let end_idx = self.instructions.len();
                     trace!("IR", "If statement ends at index {}", end_idx);
 
-                    // Update the jump if false to jump to the end
-                    if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
-                        self.instructions[jump_if_false_idx].operands[1]
-                    {
-                        *value = end_idx as f64 - 1.0;
-                        trace!(
-                            "IR",
-                            "Updated JumpIfFalse to jump to end at {}",
-                            end_idx - 1
-                        );
-                    }
+                    self.emit(
+                        OpCode::Label,
+                        vec![Operand::Label(jump_if_false_label.clone())],
+                    );
 
                     debug!("IR", "Successfully generated if statement without else");
                 }
@@ -345,7 +341,6 @@ impl IrGenerator {
                     arguments.len()
                 );
 
-                // First, evaluate all arguments and push them onto the stack
                 // (in reverse order, so first arg is on top)
                 for (i, arg) in arguments.iter().rev().enumerate() {
                     trace!(
@@ -358,9 +353,6 @@ impl IrGenerator {
                         "IR",
                         "Function argument {} result in register {}", i, arg_temp
                     );
-
-                    self.emit(OpCode::Push, vec![Operand::Register(arg_temp)]);
-                    trace!("IR", "Pushed argument from register {} to stack", arg_temp);
                 }
 
                 // Generate the call instruction
@@ -559,31 +551,32 @@ impl IrGenerator {
             }
             Expr::Variable { name } => {
                 if let TokenType::Identifier(name_str) = &name.token_type {
-                    debug!("IR", "Generating IR for variable reference '{}'", name_str);
-
-                    let result_temp = self.new_temp();
-                    trace!(
-                        "IR",
-                        "Allocating register {} for variable value",
-                        result_temp
-                    );
-
-                    self.emit(
-                        OpCode::LoadVar,
-                        vec![
-                            Operand::Register(result_temp),
-                            Operand::Variable(name_str.clone()),
-                        ],
-                    );
-
-                    debug!(
-                        "IR",
-                        "Loaded variable '{}' into register {}", name_str, result_temp
-                    );
-                    result_temp
+                    if let Some(symbol) = self.symbol_table.lookup(name_str) {
+                        match symbol.kind {
+                            SymbolKind::Param | SymbolKind::Variable => {
+                                let temp = self.new_temp();
+                                self.emit(
+                                    OpCode::LoadVar,
+                                    vec![
+                                        Operand::Variable(name_str.clone()),
+                                        Operand::Register(temp),
+                                    ],
+                                );
+                                temp
+                            }
+                            _ => {
+                                // Handle other symbol kinds if needed
+                                error!("IR", "Unexpected symbol kind");
+                                0
+                            }
+                        }
+                    } else {
+                        error!("IR", "Variable not found");
+                        0
+                    }
                 } else {
-                    error!("IR", "Expected identifier, got: {:?}", name.token_type);
-                    panic!("Expected identifier for variable name");
+                    error!("IR", "Unexpected token type in variable expression");
+                    0
                 }
             }
         }
@@ -606,5 +599,32 @@ impl IrGenerator {
         trace!("IR", "Allocating new temporary register {}", temp);
         self.temp_counter += 1;
         temp
+    }
+    pub fn log_ir_without_labels(&self) {
+        println!("--- Generated IR Instructions without labels ---");
+        for (index, instruction) in self.instructions.iter().enumerate() {
+            print!("{:04}: {:?} ", index, instruction.op);
+            for (operand_index, operand) in instruction.operands.iter().enumerate() {
+                print!("{:?}", operand);
+                if operand_index < instruction.operands.len() - 1 {
+                    print!(", ");
+                }
+            }
+            println!();
+        }
+    }
+    pub fn log_instructions(&self) {
+        println!("--- Generated IR Instructions ---");
+        for (index, instruction) in self.instructions.iter().enumerate() {
+            print!("{:04}: {:?} ", index, instruction.op);
+            for (operand_index, operand) in instruction.operands.iter().enumerate() {
+                print!("{:?}", operand);
+                if operand_index < instruction.operands.len() - 1 {
+                    print!(", ");
+                }
+            }
+            println!();
+        }
+        println!("--- End of IR Instructions ---");
     }
 }

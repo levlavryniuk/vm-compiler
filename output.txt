@@ -1,21 +1,18 @@
 
  File path: ./src/ir.rs 
  
+use crate::ast_node::*;
+use crate::tokens::*;
+use crate::{debug, error, info, trace};
 use std::collections::HashMap;
 
-use crate::{
-    ast_node::{Expr, LiteralValue, Stmt},
-    tokens::TokenType,
-};
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum OpCode {
     LoadConst,
     LoadVar,
-    Return,
     StoreVar,
-    EnterFrame,
     DeclareVar,
+    Return,
 
     Add,
     Subtract,
@@ -35,7 +32,6 @@ pub enum OpCode {
     Echo,
 
     Call,      // New: Call a function
-    Push,      // New: Push value to stack
     LoadParam, // New: Load parameter from stack
     Jump,
     JumpIfFalse,
@@ -57,17 +53,18 @@ pub enum Operand {
 #[derive(Debug)]
 pub struct IrProgram {
     pub instructions: Vec<Instruction>,
-    pub functions: HashMap<String, (usize, usize)>, // name -> (start_address, param_count)
+    pub functions: HashMap<String, (usize, usize, bool)>, // name -> (start_address, param_count)
 }
 
 pub struct IrGenerator {
     instructions: Vec<Instruction>,
-    pub functions: HashMap<String, (usize, usize)>, // name -> (start_address, param_count)
+    pub functions: HashMap<String, (usize, usize, bool)>, // name -> (start_address, param_count)
     temp_counter: usize,
 }
 
 impl IrGenerator {
     pub fn new() -> Self {
+        info!("IR", "Creating new IR generator");
         IrGenerator {
             instructions: Vec::new(),
             temp_counter: 0,
@@ -76,10 +73,22 @@ impl IrGenerator {
     }
 
     pub fn generate(&mut self, statements: &[Stmt]) -> IrProgram {
+        info!(
+            "IR",
+            "Starting IR generation for {} statements",
+            statements.len()
+        );
         for stmt in statements {
+            trace!("IR", "Generating IR for statement: {:?}", stmt);
             self.generate_statement(stmt);
         }
 
+        info!(
+            "IR",
+            "IR generation complete, produced {} instructions and {} functions",
+            self.instructions.len(),
+            self.functions.len()
+        );
         IrProgram {
             instructions: self.instructions.clone(),
             functions: self.functions.clone(),
@@ -89,61 +98,144 @@ impl IrGenerator {
     fn generate_statement(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Expression { expression } => {
+                debug!("IR", "Generating IR for expression statement");
                 self.generate_expression(expression);
+                debug!("IR", "Successfully generated IR for expression statement");
             }
-            Stmt::FunctionDeclaration { args, name, body } => {
+            Stmt::Return { value } => {
+                debug!("IR", "Generating IR for return statement");
+                if let Some(value) = value {
+                    trace!("IR", "Return statement has a value expression");
+                    let reg = self.generate_expression(value);
+                    self.emit(OpCode::Return, vec![Operand::Register(reg)]);
+                    debug!("IR", "Generated return with value in register {}", reg);
+                } else {
+                    trace!("IR", "Return statement with no value");
+                    self.emit(OpCode::Return, vec![]);
+                    debug!("IR", "Generated return with no value");
+                }
+            }
+            Stmt::FunctionDeclaration {
+                args,
+                name,
+                body,
+                returns_value,
+            } => {
+                debug!("IR", "Generating IR for function declaration '{}'", name);
                 let function_start = self.instructions.len();
+                trace!(
+                    "IR",
+                    "Function '{}' starts at instruction index {}",
+                    name,
+                    function_start
+                );
+
+                // Add jump over the function body
                 self.emit(
                     OpCode::Jump,
                     vec![Operand::Immediate(LiteralValue::Number(0.))],
                 );
+                trace!("IR", "Added jump placeholder at start of function");
 
+                // Function declaration
                 self.emit(
                     OpCode::FunctionDeclaration,
                     vec![
                         Operand::Immediate(LiteralValue::String(name.clone())),
                         Operand::Immediate(LiteralValue::Number(args.len() as f64)),
+                        Operand::Immediate(LiteralValue::Bool(*returns_value)),
                     ],
                 );
+                debug!(
+                    "IR",
+                    "Function '{}' has {} args, returns_value: {}",
+                    name,
+                    args.len(),
+                    returns_value
+                );
 
+                for (i, arg) in args.iter().enumerate() {
+                    self.generate_expression(arg);
+                    self.emit(
+                        OpCode::LoadParam,
+                        vec![Operand::Immediate(LiteralValue::Number(i as f64))],
+                    );
+                    // trace!("IR", "Declared argument '{}' at index {}", arg, i);
+                }
+
+                // Generate function body
+                trace!("IR", "Generating IR for function body");
                 self.generate_statement(body);
+                debug!("IR", "Successfully generated function body");
 
+                // Add implicit return if needed
                 self.emit(OpCode::Return, vec![]);
+                trace!("IR", "Added implicit return at end of function");
 
                 let function_end = self.instructions.len();
+                trace!(
+                    "IR",
+                    "Function '{}' ends at instruction index {}",
+                    name,
+                    function_end
+                );
 
+                // Fix up the jump at the start of the function
                 if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
                     self.instructions[function_start].operands[0]
                 {
                     *value = function_end as f64 - 1.0;
+                    trace!(
+                        "IR",
+                        "Updated jump at start of function to {} (end of function)",
+                        function_end - 1
+                    );
                 }
 
+                // Register the function
                 self.functions
-                    .insert(name.clone(), (function_start, args.len()));
+                    .insert(name.clone(), (function_start, args.len(), *returns_value));
+                info!(
+                    "IR",
+                    "Successfully registered function '{}' at position {} with {} args",
+                    name,
+                    function_start,
+                    args.len()
+                );
             }
 
             Stmt::Echo { expression } => {
+                debug!("IR", "Generating IR for echo statement");
                 let expr_temp = self.generate_expression(expression);
+                debug!("IR", "Echo expression result in register {}", expr_temp);
 
                 self.emit(OpCode::Echo, vec![Operand::Register(expr_temp)]);
+                debug!("IR", "Successfully generated IR for echo statement");
             }
             Stmt::Let { name, initializer } => {
+                debug!("IR", "Generating IR for let statement");
                 if let Some(init) = initializer {
+                    trace!("IR", "Let statement has initializer");
                     let temp = self.generate_expression(init);
+                    debug!("IR", "Initializer result in register {}", temp);
 
                     if let TokenType::Identifier(name_str) = &name.token_type {
                         self.emit(
                             OpCode::StoreVar,
                             vec![Operand::Variable(name_str.clone()), Operand::Register(temp)],
                         );
-                    }
-                } else {
-                    if let TokenType::Identifier(name_str) = &name.token_type {
-                        self.emit(
-                            OpCode::DeclareVar,
-                            vec![Operand::Variable(name_str.clone())],
+                        debug!(
+                            "IR",
+                            "Stored variable '{}' with value from register {}", name_str, temp
                         );
                     }
+                } else if let TokenType::Identifier(name_str) = &name.token_type {
+                    trace!("IR", "Let statement without initializer");
+                    self.emit(
+                        OpCode::DeclareVar,
+                        vec![Operand::Variable(name_str.clone())],
+                    );
+                    debug!("IR", "Declared variable '{}' without initializer", name_str);
                 }
             }
             Stmt::If {
@@ -151,8 +243,13 @@ impl IrGenerator {
                 then_branch,
                 else_branch,
             } => {
+                debug!("IR", "Generating IR for if statement");
                 let condition_temp = self.generate_expression(condition);
+                debug!("IR", "If condition result in register {}", condition_temp);
+
                 let jump_if_false_idx = self.instructions.len();
+                trace!("IR", "Adding JumpIfFalse at index {}", jump_if_false_idx);
+
                 self.emit(
                     OpCode::JumpIfFalse,
                     vec![
@@ -161,43 +258,90 @@ impl IrGenerator {
                     ],
                 );
 
+                trace!("IR", "Generating IR for then branch");
                 self.generate_statement(then_branch);
+                debug!("IR", "Successfully generated IR for then branch");
+
                 if let Some(else_branch) = else_branch {
+                    debug!("IR", "If statement has else branch");
                     let jump_end_idx = self.instructions.len();
+                    trace!(
+                        "IR",
+                        "Adding jump over else branch at index {}",
+                        jump_end_idx
+                    );
+
                     self.emit(
                         OpCode::Jump,
                         vec![Operand::Immediate(LiteralValue::Number(0.0))],
                     );
 
                     let else_start_idx = self.instructions.len();
+                    trace!("IR", "Else branch starts at index {}", else_start_idx);
 
+                    // Update the jump if false to jump to else
                     if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
                         self.instructions[jump_if_false_idx].operands[1]
                     {
                         *value = else_start_idx as f64;
+                        trace!(
+                            "IR",
+                            "Updated JumpIfFalse to jump to else branch at {}",
+                            else_start_idx
+                        );
                     }
 
+                    trace!("IR", "Generating IR for else branch");
                     self.generate_statement(else_branch);
+                    debug!("IR", "Successfully generated IR for else branch");
 
                     let end_idx = self.instructions.len();
+                    trace!("IR", "If-else statement ends at index {}", end_idx);
+
+                    // Update the jump at the end of the then branch
                     if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
                         self.instructions[jump_end_idx].operands[0]
                     {
                         *value = end_idx as f64 - 1.0;
+                        trace!(
+                            "IR",
+                            "Updated jump at end of then branch to {}",
+                            end_idx - 1
+                        );
                     }
+
+                    debug!("IR", "Successfully generated complete if-else statement");
                 } else {
+                    debug!("IR", "If statement has no else branch");
                     let end_idx = self.instructions.len();
+                    trace!("IR", "If statement ends at index {}", end_idx);
+
+                    // Update the jump if false to jump to the end
                     if let Operand::Immediate(LiteralValue::Number(ref mut value)) =
                         self.instructions[jump_if_false_idx].operands[1]
                     {
                         *value = end_idx as f64 - 1.0;
+                        trace!(
+                            "IR",
+                            "Updated JumpIfFalse to jump to end at {}",
+                            end_idx - 1
+                        );
                     }
+
+                    debug!("IR", "Successfully generated if statement without else");
                 }
             }
             Stmt::Block { statements } => {
+                debug!(
+                    "IR",
+                    "Generating IR for block statement with {} statements",
+                    statements.len()
+                );
                 for st in statements {
+                    trace!("IR", "Generating IR for statement in block: {:?}", st);
                     self.generate_statement(st);
                 }
+                debug!("IR", "Successfully generated IR for block statement");
             }
         }
     }
@@ -205,16 +349,36 @@ impl IrGenerator {
     fn generate_expression(&mut self, expr: &Expr) -> usize {
         match expr {
             Expr::Call { callee, arguments } => {
+                debug!(
+                    "IR",
+                    "Generating IR for function call '{}' with {} arguments",
+                    callee,
+                    arguments.len()
+                );
+
                 // First, evaluate all arguments and push them onto the stack
                 // (in reverse order, so first arg is on top)
-                for arg in arguments.iter().rev() {
+                for (i, arg) in arguments.iter().rev().enumerate() {
+                    trace!(
+                        "IR",
+                        "Generating IR for function argument {} (in reverse order)",
+                        i
+                    );
                     let arg_temp = self.generate_expression(arg);
-                    self.emit(OpCode::Push, vec![Operand::Register(arg_temp)]);
+                    debug!(
+                        "IR",
+                        "Function argument {} result in register {}", i, arg_temp
+                    );
                 }
 
-                // Get the function name from the callee
                 // Generate the call instruction
                 let result_temp = self.new_temp();
+                trace!(
+                    "IR",
+                    "Allocating register {} for function call result",
+                    result_temp
+                );
+
                 self.emit(
                     OpCode::Call,
                     vec![
@@ -224,16 +388,38 @@ impl IrGenerator {
                     ],
                 );
 
-                return result_temp;
+                debug!(
+                    "IR",
+                    "Generated call to function '{}' with {} arguments, result in register {}",
+                    callee,
+                    arguments.len(),
+                    result_temp
+                );
+
+                result_temp
             }
             Expr::Binary {
                 left,
                 operator,
                 right,
             } => {
+                debug!(
+                    "IR",
+                    "Generating IR for binary expression with operator {:?}", operator.token_type
+                );
+
                 let left_temp = self.generate_expression(left);
+                trace!("IR", "Left operand result in register {}", left_temp);
+
                 let right_temp = self.generate_expression(right);
+                trace!("IR", "Right operand result in register {}", right_temp);
+
                 let result_temp = self.new_temp();
+                trace!(
+                    "IR",
+                    "Allocating register {} for binary operation result",
+                    result_temp
+                );
 
                 let op = match operator.token_type {
                     TokenType::Plus => OpCode::Add,
@@ -246,11 +432,17 @@ impl IrGenerator {
                     TokenType::GreaterOrEq => OpCode::GreaterOrEq,
                     TokenType::Less => OpCode::Less,
                     TokenType::LessOrEq => OpCode::LessOrEq,
-                    _ => panic!("Unexpected binary operator"),
+                    _ => {
+                        error!(
+                            "IR",
+                            "Unexpected binary operator: {:?}", operator.token_type
+                        );
+                        panic!("Unexpected binary operator");
+                    }
                 };
 
                 self.emit(
-                    op,
+                    op.clone(),
                     vec![
                         Operand::Register(result_temp),
                         Operand::Register(left_temp),
@@ -258,11 +450,32 @@ impl IrGenerator {
                     ],
                 );
 
+                debug!(
+                    "IR",
+                    "Generated binary operation {:?} with registers {} and {}, result in {}",
+                    op,
+                    left_temp,
+                    right_temp,
+                    result_temp
+                );
+
                 result_temp
             }
             Expr::Unary { operator, right } => {
+                debug!(
+                    "IR",
+                    "Generating IR for unary expression with operator {:?}", operator.token_type
+                );
+
                 let right_temp = self.generate_expression(right);
+                trace!("IR", "Unary operand result in register {}", right_temp);
+
                 let result_temp = self.new_temp();
+                trace!(
+                    "IR",
+                    "Allocating register {} for unary operation result",
+                    result_temp
+                );
 
                 match operator.token_type {
                     TokenType::Minus => {
@@ -273,18 +486,39 @@ impl IrGenerator {
                                 Operand::Register(right_temp),
                             ],
                         );
+                        debug!(
+                            "IR",
+                            "Generated negate operation on register {}, result in {}",
+                            right_temp,
+                            result_temp
+                        );
                     }
-                    _ => panic!("Unexpected unary operator"),
+                    _ => {
+                        error!("IR", "Unexpected unary operator: {:?}", operator.token_type);
+                        panic!("Unexpected unary operator");
+                    }
                 }
 
                 result_temp
             }
-            Expr::Grouping { expression } => self.generate_expression(expression),
+            Expr::Grouping { expression } => {
+                debug!("IR", "Generating IR for grouped expression");
+                let result = self.generate_expression(expression);
+                debug!("IR", "Grouped expression result in register {}", result);
+                result
+            }
             Expr::Literal { value } => {
+                debug!("IR", "Generating IR for literal: {:?}", value);
+
                 let result_temp = self.new_temp();
+                trace!(
+                    "IR",
+                    "Allocating register {} for literal value",
+                    result_temp
+                );
 
                 match value {
-                    LiteralValue::Number(_) => {
+                    LiteralValue::Number(n) => {
                         self.emit(
                             OpCode::LoadConst,
                             vec![
@@ -292,8 +526,12 @@ impl IrGenerator {
                                 Operand::Immediate(value.clone()),
                             ],
                         );
+                        debug!(
+                            "IR",
+                            "Loaded number constant {} into register {}", n, result_temp
+                        );
                     }
-                    LiteralValue::String(_) => {
+                    LiteralValue::String(s) => {
                         self.emit(
                             OpCode::LoadConst,
                             vec![
@@ -301,8 +539,12 @@ impl IrGenerator {
                                 Operand::Immediate(value.clone()),
                             ],
                         );
+                        debug!(
+                            "IR",
+                            "Loaded string constant \"{}\" into register {}", s, result_temp
+                        );
                     }
-                    LiteralValue::Bool(_) => {
+                    LiteralValue::Bool(b) => {
                         self.emit(
                             OpCode::LoadConst,
                             vec![
@@ -310,16 +552,30 @@ impl IrGenerator {
                                 Operand::Immediate(value.clone()),
                             ],
                         );
+                        debug!(
+                            "IR",
+                            "Loaded boolean constant {} into register {}", b, result_temp
+                        );
                     }
-                    _ => panic!("Unexpected literal type"),
+                    _ => {
+                        error!("IR", "Unexpected literal type: {:?}", value);
+                        panic!("Unexpected literal type");
+                    }
                 }
 
                 result_temp
             }
             Expr::Variable { name } => {
-                let result_temp = self.new_temp();
-
                 if let TokenType::Identifier(name_str) = &name.token_type {
+                    debug!("IR", "Generating IR for variable reference '{}'", name_str);
+
+                    let result_temp = self.new_temp();
+                    trace!(
+                        "IR",
+                        "Allocating register {} for variable value",
+                        result_temp
+                    );
+
                     self.emit(
                         OpCode::LoadVar,
                         vec![
@@ -327,19 +583,35 @@ impl IrGenerator {
                             Operand::Variable(name_str.clone()),
                         ],
                     );
-                }
 
-                result_temp
+                    debug!(
+                        "IR",
+                        "Loaded variable '{}' into register {}", name_str, result_temp
+                    );
+                    result_temp
+                } else {
+                    error!("IR", "Expected identifier, got: {:?}", name.token_type);
+                    panic!("Expected identifier for variable name");
+                }
             }
         }
     }
 
     fn emit(&mut self, op: OpCode, operands: Vec<Operand>) {
+        trace!(
+            "IR",
+            "Emitting instruction: {:?} with {} operands at index {}",
+            op,
+            operands.len(),
+            self.instructions.len()
+        );
+
         self.instructions.push(Instruction { op, operands });
     }
 
     fn new_temp(&mut self) -> usize {
         let temp = self.temp_counter;
+        trace!("IR", "Allocating new temporary register {}", temp);
         self.temp_counter += 1;
         temp
     }
@@ -354,25 +626,17 @@ use crate::{debug, error, info, trace};
 pub struct VM {
     constants: Vec<LiteralValue>,
     variables: Vec<LiteralValue>,
-    globals: Vec<LiteralValue>,
     stack: Vec<LiteralValue>,
     ip: usize,
     fp: usize,
 }
 
-pub struct StackFrame {
-    return_addr: usize,
-    previus_frame_ptr: usize,
-    sp: usize,
-    fp: usize,
-}
 impl VM {
     pub fn new(bytecode: &Bytecode) -> Self {
         info!("VM", "Creating new VM instance");
         VM {
             constants: bytecode.constants.clone(),
-            variables: vec![LiteralValue::Number(0.); bytecode.variables.len()],
-            globals: vec![],
+            variables: vec![LiteralValue::Number(0.); 256],
             stack: Vec::with_capacity(256),
             ip: 0,
             fp: 0,
@@ -391,11 +655,15 @@ impl VM {
         }
     }
 
+    fn log_stack(&self) {
+        trace!("VM", "Current stack: {:?}", &self.stack);
+    }
+
     pub fn execute(&mut self, bytecode: &Bytecode) -> Result<LiteralValue, String> {
         info!("VM", "Starting bytecode execution");
 
         while self.ip < bytecode.instructions.len() {
-            trace!("VM", "Stack: {:?}", &self.stack);
+            self.log_stack(); // Log the current stack
             trace!(
                 "VM",
                 "IP: {}, Instruction: {}",
@@ -434,21 +702,9 @@ impl VM {
                     continue; // Skip normal ip increment
                 }
 
-                BytecodeOp::Push => {
-                    // Used for pushing function arguments
-                    if let Some(reg_idx) = operand {
-                        debug!("VM", "Pushing variable[{}] to stack", reg_idx);
-                        self.stack.push(self.variables[reg_idx].clone());
-                    }
-                }
-
                 BytecodeOp::LoadParam => {
-                    // Used to access function parameters from within function body
                     if let Some(param_idx) = operand {
-                        // Parameters are below the frame in reverse order
-                        // fp points to saved old FP, fp-1 points to return address
-                        // First parameter is at fp-2, second at fp-3, etc.
-                        let stack_idx = self.fp - 2 - param_idx;
+                        let stack_idx = self.fp - param_idx - 2; // -2 accounts for return addr and old_fp
 
                         if stack_idx < self.stack.len() {
                             debug!(
@@ -456,7 +712,7 @@ impl VM {
                                 "Loading parameter {} from stack position {}", param_idx, stack_idx
                             );
                             let param_value = self.stack[stack_idx].clone();
-                            self.stack.push(param_value);
+                            self.variables.insert(param_idx, param_value);
                         } else {
                             error!("VM", "Parameter index out of bounds: {}", param_idx);
                             return Err(format!("Parameter index out of bounds: {}", param_idx));
@@ -466,34 +722,46 @@ impl VM {
 
                 BytecodeOp::Return => {
                     // Save return value (if any)
-                    let return_value = if !self.stack.is_empty() {
+                    self.log_stack(); // Log stack before return
+                    let return_value = if self.stack.len() > self.fp {
+                        debug!("VM", "Returning value from stack");
                         self.stack.pop().unwrap()
                     } else {
+                        debug!("VM", "No return value on stack");
                         LiteralValue::Number(0.0)
                     };
+
+                    debug!("VM", "Stack after getting return value: {:?}", &self.stack);
                     debug!("VM", "Function returning with value: {:?}", return_value);
 
                     // Restore stack to previous frame
-                    self.stack.truncate(self.fp);
+                    self.log_stack(); // Log stack before restoring frame
 
                     // Pop and restore old frame pointer
-                    if let LiteralValue::Number(old_fp) = self.stack.pop().unwrap() {
+                    self.stack.truncate(self.fp + 1);
+
+                    if let Some(LiteralValue::Number(old_fp)) = self.stack.pop() {
                         self.fp = old_fp as usize;
                         debug!("VM", "Restored frame pointer to: {}", self.fp);
                     }
 
+                    debug!(
+                        "VM",
+                        "Stack after restoring frame pointer: {:?}", &self.stack
+                    );
+
                     // Pop and jump to return address
-                    if let LiteralValue::Number(return_addr) = self.stack.pop().unwrap() {
+                    if let Some(LiteralValue::Number(return_addr)) = self.stack.pop() {
                         self.ip = return_addr as usize;
                         debug!("VM", "Jumping to return address: {}", self.ip);
 
                         // Push return value back on stack
                         self.stack.push(return_value);
                         debug!("VM", "Pushed return value onto stack");
-
+                        self.log_stack(); // Log stack after return
                         continue; // Skip normal ip increment
                     } else {
-                        error!("VM", "Invalid return address on stack");
+                        error!("VM", "Missing return address on stack");
                         return Err("Invalid return address on stack".to_string());
                     }
                 }
@@ -705,6 +973,7 @@ impl VM {
                         );
                     }
                 }
+                _ => todo!(),
             }
 
             self.ip += 1;
@@ -793,15 +1062,6 @@ impl PartialEq for LiteralValue {
             _ => false,
         }
     }
-    fn ne(&self, other: &Self) -> bool {
-        match (self, other) {
-            (LiteralValue::Number(num1), LiteralValue::Number(num2)) => num1 != num2,
-            (LiteralValue::String(str1), LiteralValue::String(str2)) => str1 != str2,
-            (LiteralValue::Bool(bool1), LiteralValue::Bool(bool2)) => bool1 != bool2,
-            (LiteralValue::Nil, LiteralValue::Nil) => false,
-            _ => true,
-        }
-    }
 }
 
 impl Display for LiteralValue {
@@ -831,10 +1091,15 @@ pub enum Stmt {
     Block {
         statements: Vec<Stmt>,
     },
+
+    Return {
+        value: Option<Expr>,
+    },
     FunctionDeclaration {
         args: Vec<Expr>,
         name: String,
         body: Box<Stmt>,
+        returns_value: bool,
     },
     Let {
         name: Token,
@@ -891,27 +1156,28 @@ fn main() {
 
     let ir_program = ir.generate(&stmts);
 
-    let _ = ir_program
-        .instructions
-        .iter()
-        .enumerate()
-        .for_each(|(i, v)| {
-            println!("\nInstruction {}", i);
-            dbg!(v);
-        });
-    dbg!(&ir_program.functions);
+    dbg!(&ir_program);
+
+    // ir_program
+    //     .instructions
+    //     .iter()
+    //     .enumerate()
+    //     .for_each(|(i, v)| {
+    //         println!("\nInstruction {}", i);
+    //         dbg!(v);
+    //     });
+    // dbg!(&ir_program.functions);
     let mut codegen = BytecodeGenerator::new();
 
     let bytecode = codegen.generate(&ir_program);
 
-    bytecode.instructions.iter().enumerate().for_each(|(i, v)| {
-        println!("\nInstruction {}", i);
-        dbg!(v);
-    });
+    // bytecode.instructions.iter().enumerate().for_each(|(i, v)| {
+    //     println!("\nInstruction {}", i);
+    //     dbg!(v);
+    // });
     let mut vm = VM::new(&bytecode);
 
-    let _ = vm.execute(&bytecode);
-    ()
+    vm.execute(&bytecode).unwrap();
 }
 
  File path: ./src/tokens.rs 
@@ -961,6 +1227,7 @@ pub enum TokenType {
     Else,
     Echo,
     // Control
+    Return,
     EOF,
 }
 
@@ -1234,6 +1501,7 @@ impl Lexer {
             "false" => TokenType::Bool(false),
             "echo" => TokenType::Echo,
             "fn" => TokenType::FunctionDeclaration,
+            "return" => TokenType::Return,
             _ => TokenType::Identifier(identifier),
         };
 
@@ -1367,11 +1635,13 @@ impl Lexer {
 
  File path: ./src/codegen.rs 
  
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Deref};
 
 use crate::{
     ast_node::LiteralValue,
+    debug, error, info,
     ir::{Instruction, IrProgram, OpCode, Operand},
+    trace,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -1379,6 +1649,7 @@ pub enum BytecodeOp {
     LoadConst,
     LoadVar,
     StoreVar,
+    EnterStackFrame,
     Add,
     Subtract,
     Multiply,
@@ -1393,7 +1664,6 @@ pub enum BytecodeOp {
     Less,
     GreaterOrEq,
     Call,      // New: Call a function
-    Push,      // New: Push value to stack
     LoadParam, // New: Load parameter from stack
     LessOrEq,
     JumpIfFalse,
@@ -1404,20 +1674,21 @@ pub enum BytecodeOp {
 pub struct Bytecode {
     pub constants: Vec<LiteralValue>,
     pub variables: Vec<String>,
-    pub functions: HashMap<String, (usize, usize)>, // name -> (start_address, param_count)
+    pub functions: HashMap<String, (usize, usize, bool)>,
+    // name -> (start_address, param_count, does_return?)
     pub instructions: Vec<(BytecodeOp, Option<usize>)>,
 }
 
 pub struct BytecodeGenerator {
     constants: Vec<LiteralValue>,
-
-    pub functions: HashMap<String, (usize, usize)>, // name -> (start_address, param_count)
+    pub functions: HashMap<String, (usize, usize, bool)>, // name -> (start_address, param_count)
     variables: Vec<String>,
     instructions: Vec<(BytecodeOp, Option<usize>)>,
 }
 
 impl BytecodeGenerator {
     pub fn new() -> Self {
+        info!("Bytecode", "Creating new Bytecode generator");
         BytecodeGenerator {
             constants: Vec::new(),
             variables: Vec::new(),
@@ -1427,13 +1698,25 @@ impl BytecodeGenerator {
     }
 
     pub fn generate(&mut self, ir: &IrProgram) -> Bytecode {
+        info!(
+            "Bytecode",
+            "Starting Bytecode generation for {} instructions",
+            ir.instructions.len()
+        );
         for instruction in &ir.instructions {
+            trace!(
+                "Bytecode",
+                "Generating Bytecode for instruction: {:?}",
+                instruction
+            );
             self.generate_instruction(instruction);
         }
 
-        // Add a return instruction at the end
-        self.emit(BytecodeOp::Return, None);
-
+        info!(
+            "Bytecode",
+            "Bytecode generation complete, produced {} instructions",
+            self.instructions.len()
+        );
         Bytecode {
             constants: self.constants.clone(),
             variables: self.variables.clone(),
@@ -1448,20 +1731,31 @@ impl BytecodeGenerator {
                 if let Operand::Immediate(value) = &instruction.operands[1] {
                     let const_idx = self.add_constant(value.clone());
                     self.emit(BytecodeOp::LoadConst, Some(const_idx));
+                    trace!("Bytecode", "Loaded constant at index {}", const_idx);
                 }
             }
             OpCode::FunctionDeclaration => {
                 if let (
                     Operand::Immediate(LiteralValue::String(name)),
                     Operand::Immediate(LiteralValue::Number(param_count)),
-                ) = (&instruction.operands[0], &instruction.operands[1])
-                {
-                    // Record the current position as the start of this function
+                    Operand::Immediate(LiteralValue::Bool(has_return_value)),
+                ) = (
+                    &instruction.operands[0],
+                    &instruction.operands[1],
+                    &instruction.operands[2],
+                ) {
                     let function_start = self.instructions.len();
-
-                    // Add function entry to our function table
-                    self.functions
-                        .insert(name.clone(), (function_start, *param_count as usize));
+                    self.functions.insert(
+                        name.clone(),
+                        (function_start, *param_count as usize, *has_return_value),
+                    );
+                    info!(
+                        "Bytecode",
+                        "Registered function '{}' at position {} with {} params",
+                        name,
+                        function_start,
+                        param_count
+                    );
                 }
             }
 
@@ -1469,16 +1763,22 @@ impl BytecodeGenerator {
                 if let [Operand::Register(result_reg), Operand::Immediate(LiteralValue::String(name)), Operand::Immediate(LiteralValue::Number(_))] =
                     instruction.operands.as_slice()
                 {
-                    if let Some((function_addr, _)) = self.functions.get(name) {
-                        let return_addr = self.instructions.len();
-                        // Generate call instruction with function address
-                        // VM jumps to the function code
-                        self.emit(BytecodeOp::Call, Some(*function_addr));
+                    if let Some((function_addr, ..)) = self.functions.get(name) {
+                        let function_addr = *function_addr;
 
-                        // After return, the result will be on top of stack
-                        // We need to store it in the result register
-                        self.emit(BytecodeOp::StoreVar, Some(*result_reg));
+                        self.emit(BytecodeOp::Call, Some(function_addr));
+                        // if returns_value {
+                        //     self.emit(BytecodeOp::StoreVar, Some(*result_reg));
+                        //     trace!("Bytecode", "Stored return value in register {}", result_reg);
+                        // }
+                        trace!(
+                            "Bytecode",
+                            "Generated call to function '{}' at address {}",
+                            name,
+                            function_addr
+                        );
                     } else {
+                        error!("Bytecode", "Function not found: {}", name);
                         panic!("Function not found: {}", name);
                     }
                 } else {
@@ -1487,63 +1787,89 @@ impl BytecodeGenerator {
             }
 
             OpCode::Return => {
-                self.emit(BytecodeOp::Return, None);
+                if let Some(Operand::Register(reg_idx)) = instruction.operands.last() {
+                    self.emit(BytecodeOp::Return, Some(*reg_idx));
+                    trace!(
+                        "Bytecode",
+                        "Generated return instruction with register {}",
+                        reg_idx
+                    );
+                } else {
+                    self.emit(BytecodeOp::Return, None);
+                    trace!("Bytecode", "Generated return instruction with no value");
+                }
             }
 
             OpCode::LoadParam => {
-                if let Operand::Immediate(LiteralValue::Number(idx)) = &instruction.operands[1] {
-                    // Load parameter at index from stack into register
+                if let Operand::Immediate(LiteralValue::Number(idx)) = &instruction.operands[0] {
                     self.emit(BytecodeOp::LoadParam, Some(*idx as usize));
+                    trace!("Bytecode", "Loaded parameter at index {}", idx);
                 }
             }
 
-            OpCode::Push => {
-                if let Operand::Register(reg) = instruction.operands[0] {
-                    // Push value from register to stack for function call
-                    self.emit(BytecodeOp::Push, Some(reg));
-                }
-            }
             OpCode::DeclareVar => {
                 if let Operand::Immediate(LiteralValue::String(s)) = &instruction.operands[0] {
                     let var_idx = self.add_variable(s);
                     self.emit(BytecodeOp::StoreVar, Some(var_idx));
+                    trace!("Bytecode", "Declared variable '{}' at index {}", s, var_idx);
                 }
             }
 
             OpCode::Equals => {
                 self.emit(BytecodeOp::Equals, None);
+                trace!("Bytecode", "Generated Equals instruction");
             }
 
             OpCode::LessOrEq => {
                 self.emit(BytecodeOp::LessOrEq, None);
+                trace!("Bytecode", "Generated LessOrEq instruction");
             }
 
             OpCode::Less => {
                 self.emit(BytecodeOp::Less, None);
+                trace!("Bytecode", "Generated Less instruction");
             }
 
             OpCode::GreaterOrEq => {
                 self.emit(BytecodeOp::GreaterOrEq, None);
+                trace!("Bytecode", "Generated GreaterOrEq instruction");
             }
 
             OpCode::Greater => {
                 self.emit(BytecodeOp::Greater, None);
+                trace!("Bytecode", "Generated Greater instruction");
             }
             OpCode::NotEquals => {
                 self.emit(BytecodeOp::NotEquals, None);
+                trace!("Bytecode", "Generated NotEquals instruction");
             }
-            OpCode::Echo => self.emit(BytecodeOp::Echo, None),
+            OpCode::Echo => {
+                self.emit(BytecodeOp::Echo, None);
+                trace!("Bytecode", "Generated Echo instruction");
+            }
 
             OpCode::LoadVar => {
                 if let Operand::Variable(ref name) = instruction.operands[1] {
                     let var_idx = self.add_variable(name);
                     self.emit(BytecodeOp::LoadVar, Some(var_idx));
+                    trace!(
+                        "Bytecode",
+                        "Loaded variable '{}' at index {}",
+                        name,
+                        var_idx
+                    );
                 }
             }
             OpCode::StoreVar => {
                 if let Operand::Variable(ref name) = instruction.operands[0] {
                     let var_idx = self.add_variable(name);
                     self.emit(BytecodeOp::StoreVar, Some(var_idx));
+                    trace!(
+                        "Bytecode",
+                        "Stored variable '{}' at index {}",
+                        name,
+                        var_idx
+                    );
                 }
             }
             OpCode::Jump => {
@@ -1551,6 +1877,11 @@ impl BytecodeGenerator {
                     instruction.operands[0]
                 {
                     self.emit(BytecodeOp::Jump, Some(target_addr as usize));
+                    trace!(
+                        "Bytecode",
+                        "Generated Jump instruction to address {}",
+                        target_addr
+                    );
                 }
             }
             OpCode::JumpIfFalse => {
@@ -1558,13 +1889,33 @@ impl BytecodeGenerator {
                     instruction.operands[1]
                 {
                     self.emit(BytecodeOp::JumpIfFalse, Some(target_addr as usize));
+                    trace!(
+                        "Bytecode",
+                        "Generated JumpIfFalse instruction to address {}",
+                        target_addr
+                    );
                 }
             }
-            OpCode::Add => self.emit(BytecodeOp::Add, None),
-            OpCode::Subtract => self.emit(BytecodeOp::Subtract, None),
-            OpCode::Multiply => self.emit(BytecodeOp::Multiply, None),
-            OpCode::Divide => self.emit(BytecodeOp::Divide, None),
-            OpCode::Negate => self.emit(BytecodeOp::Negate, None),
+            OpCode::Add => {
+                self.emit(BytecodeOp::Add, None);
+                trace!("Bytecode", "Generated Add instruction");
+            }
+            OpCode::Subtract => {
+                self.emit(BytecodeOp::Subtract, None);
+                trace!("Bytecode", "Generated Subtract instruction");
+            }
+            OpCode::Multiply => {
+                self.emit(BytecodeOp::Multiply, None);
+                trace!("Bytecode", "Generated Multiply instruction");
+            }
+            OpCode::Divide => {
+                self.emit(BytecodeOp::Divide, None);
+                trace!("Bytecode", "Generated Divide instruction");
+            }
+            OpCode::Negate => {
+                self.emit(BytecodeOp::Negate, None);
+                trace!("Bytecode", "Generated Negate instruction");
+            }
             _ => (),
         }
     }
@@ -1576,6 +1927,7 @@ impl BytecodeGenerator {
 
         let idx = self.constants.len();
         self.constants.push(value);
+        trace!("Bytecode", "Added constant at index {}", idx);
         idx
     }
 
@@ -1586,11 +1938,18 @@ impl BytecodeGenerator {
 
         let idx = self.variables.len();
         self.variables.push(name.to_string());
+        trace!("Bytecode", "Added variable '{}' at index {}", name, idx);
         idx
     }
 
     fn emit(&mut self, op: BytecodeOp, operand: Option<usize>) {
         self.instructions.push((op, operand));
+        trace!(
+            "Bytecode",
+            "Emitted instruction: {:?} with operand {:?}",
+            op,
+            operand
+        );
     }
 }
 
@@ -1875,6 +2234,11 @@ impl Parser {
                 self.advance();
                 self.echo_statement()
             }
+            TokenType::Return => {
+                debug!("Parser", "Parsing return statement at line {}", token.line);
+                self.advance();
+                self.return_statement()
+            }
             TokenType::FunctionDeclaration => {
                 debug!(
                     "Parser",
@@ -1959,15 +2323,29 @@ impl Parser {
                     }
                 };
 
+                let returns_value = if let Stmt::Block { statements } = &function_body {
+                    statements.last().map_or(false, |s| {
+                        if let Stmt::Return { value } = s {
+                            value.is_some()
+                        } else {
+                            false
+                        }
+                    })
+                } else {
+                    false
+                };
+
                 debug!(
                     "Parser",
-                    "Successfully parsed function declaration '{}'", function_name
+                    "Successfully parsed function declaration without return value '{}'",
+                    function_name
                 );
-                return Ok(Stmt::FunctionDeclaration {
+                Ok(Stmt::FunctionDeclaration {
                     args,
                     name: function_name,
                     body: Box::new(function_body),
-                });
+                    returns_value,
+                })
             } else {
                 error!("Parser", "Expected {{, found {:?}", self.peek());
                 Err(String::from("Expected function body"))
@@ -1976,6 +2354,25 @@ impl Parser {
             error!("Parser", "Expected (, found {:?}", self.peek());
             Err(String::from("Expected left paren"))
         }
+    }
+
+    fn return_statement(&mut self) -> Result<Stmt, String> {
+        trace!("Parser", "Looking for return expression");
+        if self.peek().token_type == TokenType::RightBrace {
+            debug!("Parser", "No return expression found");
+            return Ok(Stmt::Return { value: None });
+        }
+        let expr = match self.expression() {
+            Ok(e) => e,
+            Err(e) => {
+                error!("Parser", "Failed to parse return expression: {}", e);
+                return Err(e);
+            }
+        };
+
+        debug!("Parser", "Successfully parsed return expression");
+
+        Ok(Stmt::Return { value: Some(expr) })
     }
 
     fn let_statement(&mut self) -> Result<Stmt, String> {
@@ -2201,8 +2598,6 @@ impl Parser {
                     callee: name.to_string(),
                     arguments: args,
                 });
-            } else {
-                return Err(String::from("Expected left paren"));
             }
         }
         Ok(expr)

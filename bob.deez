@@ -1,7 +1,18 @@
-fn bob(counter) {
-  return
+fn countdown(n){
+    echo n
+    if n <= 0 {
+        echo "Blastoff!"
+        return
+    }
+    return countdown(n-1)
+}
+
+fn double_echo(first,second){
+    echo first
+    echo second
 }
 
 
+double_echo("Hello", "World")
 
-bob(10)
+

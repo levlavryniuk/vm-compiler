@@ -64,7 +64,7 @@ impl VM {
                     debug!("VM", "Calling function at address {}", function_addr);
 
                     // Save return address (next instruction after this call)
-                    let return_addr = self.ip + 1;
+                    let return_addr = self.ip;
                     self.stack.push(LiteralValue::Number(return_addr as f64));
                     debug!("VM", "Saved return address: {}", return_addr);
 
@@ -81,21 +81,9 @@ impl VM {
                     continue; // Skip normal ip increment
                 }
 
-                BytecodeOp::Push => {
-                    // Used for pushing function arguments
-                    if let Some(reg_idx) = operand {
-                        debug!("VM", "Pushing variable[{}] to stack", reg_idx);
-                        self.stack.push(self.variables[reg_idx].clone());
-                    }
-                }
-
                 BytecodeOp::LoadParam => {
-                    // Used to access function parameters from within function body
                     if let Some(param_idx) = operand {
-                        // Parameters are below the frame in reverse order
-                        // fp points to saved old FP, fp-1 points to return address
-                        // First parameter is at fp-2, second at fp-3, etc.
-                        let stack_idx = self.fp - 2 - param_idx;
+                        let stack_idx = self.fp - param_idx - 2; // -2 accounts for return addr and old_fp
 
                         if stack_idx < self.stack.len() {
                             debug!(
@@ -103,7 +91,9 @@ impl VM {
                                 "Loading parameter {} from stack position {}", param_idx, stack_idx
                             );
                             let param_value = self.stack[stack_idx].clone();
-                            self.stack.push(param_value);
+
+                            // self.stack.push(param_value);
+                            self.variables.insert(param_idx, param_value);
                         } else {
                             error!("VM", "Parameter index out of bounds: {}", param_idx);
                             return Err(format!("Parameter index out of bounds: {}", param_idx));
@@ -114,41 +104,40 @@ impl VM {
                 BytecodeOp::Return => {
                     // Save return value (if any)
                     self.log_stack(); // Log stack before return
-                    let return_value = if self.stack.len() > 2 {
+                    let return_value = if self.stack.len() > self.fp + 1 {
                         debug!("VM", "Returning value from stack");
-                        self.stack.pop().unwrap()
+                        Some(self.stack.pop().unwrap())
                     } else {
-                        debug!("VM", "No return value on stack");
-                        LiteralValue::Number(0.0)
+                        None
                     };
 
                     debug!("VM", "Stack after getting return value: {:?}", &self.stack);
-                    debug!("VM", "Function returning with value: {:?}", return_value);
+                    match return_value {
+                        Some(ref v) => debug!("VM", "Function returning with value: {:?}", &v),
+                        None => debug!("VM", "Function returning with no value"),
+                    }
 
-                    // Restore stack to previous frame
                     self.log_stack(); // Log stack before restoring frame
 
-                    // Pop and restore old frame pointer
                     if let Some(LiteralValue::Number(old_fp)) = self.stack.pop() {
                         self.fp = old_fp as usize;
                         debug!("VM", "Restored frame pointer to: {}", self.fp);
                     }
-
-                    debug!(
-                        "VM",
-                        "Stack after restoring frame pointer: {:?}", &self.stack
-                    );
 
                     // Pop and jump to return address
                     if let Some(LiteralValue::Number(return_addr)) = self.stack.pop() {
                         self.ip = return_addr as usize;
                         debug!("VM", "Jumping to return address: {}", self.ip);
 
+                        debug!("VM", "Trucating stack to frame pointer");
+                        self.stack.truncate(self.fp + 1);
+                        self.log_stack();
                         // Push return value back on stack
-                        self.stack.push(return_value);
-                        debug!("VM", "Pushed return value onto stack");
+                        if let Some(v) = return_value {
+                            self.stack.push(v);
+                            debug!("VM", "Pushed return value onto stack");
+                        }
                         self.log_stack(); // Log stack after return
-                        continue; // Skip normal ip increment
                     } else {
                         error!("VM", "Missing return address on stack");
                         return Err("Invalid return address on stack".to_string());
@@ -362,6 +351,7 @@ impl VM {
                         );
                     }
                 }
+                _ => todo!(),
             }
 
             self.ip += 1;
